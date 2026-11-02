@@ -127,6 +127,10 @@ class MenuAppController(NSObject):
         self._is_capturing_key = False
         self._capture_delegate = None
 
+        # Model download and loading tracking
+        self._model_progress_str = ""
+        self._model_error = None
+
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -199,11 +203,21 @@ class MenuAppController(NSObject):
         pct = int(downloaded / total * 100) if total > 0 else 0
         mb_down = downloaded / (1024 * 1024)
         mb_total = total / (1024 * 1024)
+        self._model_progress_str = f"Скачивание модели: {pct}% ({int(mb_down)}/{int(mb_total)} МБ)"
         AppHelper.callAfter(
-            self.update_status_title, f"{pct}% ({int(mb_down)}/{int(mb_total)}M)"
+            self.update_status_title, f" {pct}%"
         )
+        if self._status_menu_item and not self.engine.is_loaded and not self._model_error:
+            AppHelper.callAfter(
+                self._status_menu_item.setTitle_, f"⏳ {self._model_progress_str}"
+            )
 
     def _initial_model_load(self):
+        self._model_error = None
+        self._model_progress_str = "Подготовка к загрузке..."
+        AppHelper.callAfter(self.update_status_title, " ⏳")
+        AppHelper.callAfter(self.rebuild_menu)
+
         try:
             import gigaam
             if hasattr(gigaam, "set_download_progress_callback"):
@@ -213,23 +227,38 @@ class MenuAppController(NSObject):
 
         success = self.engine.load()
         if success:
+            self._model_error = None
+            self._model_progress_str = ""
             AppHelper.callAfter(self.onModelLoaded_, None)
         else:
+            self._model_error = self.engine.load_error or "Неизвестная ошибка загрузки"
             AppHelper.callAfter(
-                self.onModelError_, self.engine.load_error or "Unknown error"
+                self.onModelError_, self._model_error
             )
 
     def onModelLoaded_(self, _):
+        self._model_error = None
+        self._model_progress_str = ""
         self.update_status_title("")
         self.rebuild_menu()
         logger.info("Ready for dictation.")
 
     def onModelError_(self, error_str):
-        self.update_status_title("Ошибка GigaAM")
+        self._model_error = error_str
+        self.update_status_title(" ⚠️")
         self.rebuild_menu()
         logger.error(f"Model load error: {error_str}")
 
-    def update_status_title(self, title: str, recording: bool = False):
+    @objc.IBAction
+    def onRetryModelLoad_(self, sender):
+        logger.info("Retrying model load by user request...")
+        self._model_error = None
+        self._model_progress_str = "Перезапуск загрузки..."
+        self.update_status_title(" ⏳")
+        self.rebuild_menu()
+        _WORKER_EXECUTOR.submit(self._initial_model_load)
+
+    def update_status_title(self, title: str = "", recording: bool = False):
         if self.status_item and self.status_item.button():
             btn = self.status_item.button()
             if recording:
@@ -237,11 +266,16 @@ class MenuAppController(NSObject):
                     btn.setImage_(self.menu_icon_rec)
                 btn.setImagePosition_(NSImageOnly)
                 btn.setTitle_("")
+            elif self._model_error:
+                if self.menu_icon:
+                    btn.setImage_(self.menu_icon)
+                btn.setImagePosition_(NSImageLeft)
+                btn.setTitle_(" ⚠️")
             elif not self.engine.is_loaded:
                 if self.menu_icon:
                     btn.setImage_(self.menu_icon)
                 btn.setImagePosition_(NSImageLeft)
-                btn.setTitle_(" ⏳")
+                btn.setTitle_(title if title else " ⏳")
             else:
                 # Ready state: clean icon only, takes ~24px, never hidden by MacBook notch!
                 if self.menu_icon:
@@ -257,8 +291,10 @@ class MenuAppController(NSObject):
         # 1. Header / Status
         if self.recorder.is_recording:
             status_text = "🔴 Идет запись голоса..."
+        elif self._model_error:
+            status_text = f"⚠️ Ошибка: {self._model_error[:40]}"
         elif not self.engine.is_loaded:
-            status_text = "⏳ Загрузка модели GigaAM-v3..."
+            status_text = f"⏳ {self._model_progress_str or 'Загрузка модели GigaAM-v3...'}"
         else:
             mode_desc = (
                 "Удерживайте"
@@ -275,6 +311,13 @@ class MenuAppController(NSObject):
         status_item.setEnabled_(False)
         menu.addItem_(status_item)
         self._status_menu_item = status_item
+
+        if self._model_error:
+            retry_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "🔄 Повторить загрузку модели", "onRetryModelLoad:", ""
+            )
+            retry_item.setTarget_(self)
+            menu.addItem_(retry_item)
 
         # 2. Manual toggle recording
         action_title = (

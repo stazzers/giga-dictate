@@ -1,4 +1,5 @@
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
@@ -16,17 +17,17 @@ config_dir = os.path.expanduser("~/.config/giga_dictate")
 try:
     os.makedirs(config_dir, mode=0o700, exist_ok=True)
     os.chmod(config_dir, 0o700)
-    # Purge any legacy log files and history from disk
-    for f in ("app.log", "history.json"):
-        fp = os.path.join(config_dir, f)
-        if os.path.exists(fp):
-            os.remove(fp)
+    # Purge history from disk
+    hp = os.path.join(config_dir, "history.json")
+    if os.path.exists(hp):
+        os.remove(hp)
 except OSError:
     pass
 
-# Zero-Disk Logging: Stream directly to stdout/stderr (zero log files on disk)
+log_path = os.path.join(config_dir, "app.log")
 handlers = [
     logging.StreamHandler(sys.stdout),
+    RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=1, encoding="utf-8"),
 ]
 
 logging.basicConfig(

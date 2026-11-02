@@ -87,10 +87,32 @@ class GigaAMEngine:
                 self._load_error = None
                 self._loaded_event.set()
                 logger.info(
-                    f"Model '{self.model_name}' loaded & warmed up in {time.time() - t0:.2f}s"
+                    f"Model '{self.model_name}' loaded & warmed up on {self.device_str} in {time.time() - t0:.2f}s"
                 )
                 return True
             except Exception as e:
+                # If MPS initialization or warmup failed, fallback to CPU
+                if self.device_str == "mps":
+                    logger.warning(
+                        f"Failed to load model on MPS ({e}). Falling back to CPU..."
+                    )
+                    try:
+                        self.device_str = "cpu"
+                        self.model = gigaam.load_model(
+                            self.model_name,
+                            device="cpu",
+                            fp16_encoder=False,
+                        )
+                        self._warmup()
+                        self._is_loaded = True
+                        self._load_error = None
+                        self._loaded_event.set()
+                        logger.info(
+                            f"Model '{self.model_name}' loaded & warmed up on CPU fallback in {time.time() - t0:.2f}s"
+                        )
+                        return True
+                    except Exception as cpu_e:
+                        logger.error(f"CPU fallback also failed: {cpu_e}")
                 self._is_loaded = False
                 self._load_error = str(e)
                 self._loaded_event.set()  # unblock waiters with error

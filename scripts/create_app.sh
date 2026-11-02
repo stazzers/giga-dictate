@@ -28,8 +28,11 @@ fi
 echo "Bundling Python modules into Resources..."
 cp -R "$DIR/giga_dictate" "$RESOURCES_DIR/giga_dictate"
 cp -R "$DIR/GigaAM_repo" "$RESOURCES_DIR/GigaAM_repo"
-# Clean .git and __pycache__ from bundle
+# Clean .git, tests, and __pycache__ from bundle
 rm -rf "$RESOURCES_DIR/GigaAM_repo/.git"
+rm -rf "$RESOURCES_DIR/GigaAM_repo/tests"
+rm -rf "$RESOURCES_DIR/GigaAM_repo/tutorial"
+rm -rf "$RESOURCES_DIR/GigaAM_repo/docs"
 find "$RESOURCES_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 chmod -R u+w "$APP_DIR"
 
@@ -90,6 +93,18 @@ if [ -d "$DIR/.venv" ]; then
     echo "Bundling dependencies from .venv into Resources/venv..."
     mkdir -p "$RESOURCES_DIR/venv/lib/python3.11"
     cp -R "$DIR/.venv/lib/python3.11/site-packages" "$RESOURCES_DIR/venv/lib/python3.11/"
+
+    # Install standalone gigaam package directly into site-packages
+    echo "Installing clean standalone gigaam package into site-packages..."
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/gigaam"
+    cp -R "$DIR/GigaAM_repo/gigaam" "$RESOURCES_DIR/venv/lib/python3.11/site-packages/gigaam"
+
+    # Purge editable links, .pth files, and metadata containing local developer paths
+    echo "Purging editable links and local developer paths..."
+    rm -f "$RESOURCES_DIR/venv/lib/python3.11/site-packages/__editable__"*
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/gigaam-"*.dist-info
+    find "$RESOURCES_DIR/venv/lib/python3.11/site-packages" -name "direct_url.json" -exec rm -f {} +
+
     # Prune developer headers and unused protoc binary to optimize footprint
     rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/include"
     rm -f "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/bin/protoc"*
@@ -170,6 +185,16 @@ codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
 codesign -s - --force "$MACOS_DIR/GigaDictate"
 codesign -s - --force --entitlements "$DIR/entitlements.plist" "$APP_DIR"
 codesign -vvv --deep --strict "$APP_DIR"
+
+# 8. Strict verification: ensure zero references to local developer home directory
+echo "Verifying zero developer paths in release bundle..."
+DEV_PATH_MATCHES=$(grep -rnI "/Users/ctazzerc" "$APP_DIR" 2>/dev/null || true)
+if [ -n "$DEV_PATH_MATCHES" ]; then
+    echo "❌ ERROR: Found leftover references to developer directory in $APP_DIR:"
+    echo "$DEV_PATH_MATCHES"
+    exit 1
+fi
+echo "✅ Bundle verified: ZERO references to developer directory."
 
 echo "================================================="
 echo " Standalone bundle built successfully: $APP_DIR"
