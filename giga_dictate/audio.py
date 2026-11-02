@@ -115,26 +115,34 @@ class AudioRecorder:
             if not self._recording or not self._frames:
                 return np.array([], dtype=np.float32)
 
+            n_frames = len(self._frames)
             if max_seconds is not None:
                 max_samples = int(max_seconds * self.sample_rate)
                 if max_samples <= 0:
                     return np.array([], dtype=np.float32)
-                total = 0
-                needed_frames = []
-                for frame in reversed(self._frames):
-                    needed_frames.append(frame)
-                    total += len(frame)
-                    if total >= max_samples:
+
+                # Pre-compute needed frame boundaries from the end without O(N^2) buffer reallocation
+                accumulated = 0
+                start_idx = 0
+                for idx in range(n_frames - 1, -1, -1):
+                    accumulated = accumulated + len(self._frames[idx])
+                    if accumulated >= max_samples:
+                        start_idx = idx
                         break
-                frames_copy = list(reversed(needed_frames))
+                frames_slice = self._frames[start_idx:]
             else:
                 max_samples = None
-                frames_copy = list(self._frames)
+                frames_slice = list(self._frames)
 
-        if not frames_copy:
+        if not frames_slice:
             return np.array([], dtype=np.float32)
 
-        audio = np.concatenate(frames_copy, axis=0).ravel()
+        # Instantaneous tail slice extraction: avoid full-array concatenation when single frame
+        if len(frames_slice) == 1:
+            audio = frames_slice[0].ravel()
+        else:
+            audio = np.concatenate(frames_slice, axis=0).ravel()
+
         if max_samples is not None and len(audio) > max_samples:
             audio = audio[-max_samples:]
         return audio.astype(np.float32, copy=False)

@@ -603,6 +603,107 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(w_frame.size.width, 26.0)
         self.assertEqual(w_frame.size.height, 14.0)
 
+    def test_engine_vad_pause_skips_gpu_forward(self):
+        """transcribe_preview must skip redundant GPU forward passes when user pauses (delta is silence)."""
+        engine = GigaAMEngine(device="cpu")
+        engine._is_loaded = True
+
+        mock_model = MagicMock()
+        mock_model._dtype = torch.float32
+        mock_model._device = torch.device("cpu")
+        mock_model.forward.return_value = (torch.zeros((1, 5, 10)), torch.tensor([5]))
+        mock_model._decode.return_value = [("привет мир", None)]
+        engine.model = mock_model
+
+        # 1. First tick with speech audio (1s)
+        audio_speech = (np.sin(np.linspace(0, 100, 16000)) * 0.5).astype(np.float32)
+        text1 = engine.transcribe_preview(audio_speech)
+        self.assertEqual(text1, "привет мир")
+        self.assertEqual(mock_model.forward.call_count, 1)
+
+        # 2. Second tick: audio has accumulated 0.5s of silence (pause/breath)
+        silence_tail = np.zeros(8000, dtype=np.float32)
+        audio_paused = np.concatenate([audio_speech, silence_tail])
+        text2 = engine.transcribe_preview(audio_paused)
+        # Returns cached text immediately without GPU forward pass!
+        self.assertEqual(text2, "привет мир")
+        self.assertEqual(mock_model.forward.call_count, 1)
+
+        # 3. Third tick: user resumes speaking with new speech syllables
+        more_speech = (np.sin(np.linspace(0, 50, 8000)) * 0.5).astype(np.float32)
+        mock_model._decode.return_value = [("привет мир как дела", None)]
+        audio_resumed = np.concatenate([audio_paused, more_speech])
+        text3 = engine.transcribe_preview(audio_resumed)
+        self.assertEqual(text3, "привет мир как дела")
+        self.assertEqual(mock_model.forward.call_count, 2)
+
+    def test_engine_reset_preview_cache(self):
+        """reset_preview_cache must reset cached preview length and text."""
+        engine = GigaAMEngine(device="cpu")
+        engine._last_preview_len = 16000
+        engine._last_preview_text = "тест"
+        engine.reset_preview_cache()
+        self.assertEqual(engine._last_preview_len, 0)
+        self.assertEqual(engine._last_preview_text, "")
+
+    def test_audio_recorder_snapshot_single_and_multi_frame(self):
+        """AudioRecorder.get_stream_snapshot handles single-frame fast path and multi-frame slicing."""
+        recorder = AudioRecorder()
+        recorder._recording = True
+        f1 = np.ones((8000, 1), dtype=np.float32)
+        f2 = np.full((8000, 1), 2.0, dtype=np.float32)
+        with recorder._lock:
+            recorder._frames = [f1]
+
+        # Single frame fast path
+        snap1 = recorder.get_stream_snapshot(max_seconds=0.5)
+        self.assertEqual(len(snap1), 8000)
+        self.assertEqual(snap1[0], 1.0)
+
+        # Multi-frame slicing
+        with recorder._lock:
+            recorder._frames.append(f2)
+        snap_all = recorder.get_stream_snapshot(max_seconds=None)
+        self.assertEqual(len(snap_all), 16000)
+        self.assertEqual(snap_all[-1], 2.0)
+        recorder.close()
+
+    def test_hud_anchor_caching_and_measurement_memoization(self):
+        """VoiceInputHUD caches caret anchor and memoizes string measurements during preview expansions."""
+        hud = VoiceInputHUD.alloc().init()
+        hud.setLivePreviewEnabled_(True)
+
+        self.assertIsNone(hud._anchor_center_x)
+        self.assertIsNone(hud._anchor_top_y)
+        self.assertIn("...", hud._measure_cache)
+
+        hud.showRecording()
+        self.assertIsNotNone(hud._anchor_center_x)
+        self.assertIsNotNone(hud._anchor_top_y)
+        initial_anchor_x = hud._anchor_center_x
+
+        # Preview update: anchor center should remain stable
+        hud.setPreviewText_("Короткий текст")
+        self.assertEqual(hud._anchor_center_x, initial_anchor_x)
+        self.assertIn("Короткий текст", hud._measure_cache)
+
+        # Calling again with identical text reuses measurement cache
+        cached_dims = hud._measure_cache["Короткий текст"]
+        hud.setPreviewText_("Короткий текст")
+        self.assertEqual(hud._measure_cache["Короткий текст"], cached_dims)
+
+        # Hiding HUD clears anchor
+        hud.hideHUD()
+        self.assertIsNone(hud._anchor_center_x)
+        self.assertIsNone(hud._anchor_top_y)
+
+    def test_menu_app_darwin_qos_elevation(self):
+        """_set_thread_qos_user_interactive safely sets Darwin QOS_CLASS_USER_INTERACTIVE."""
+        from giga_dictate.menu_app import _set_thread_qos_user_interactive
+
+        # Should execute cleanly without throwing
+        _set_thread_qos_user_interactive()
+
 
 if __name__ == "__main__":
     unittest.main()

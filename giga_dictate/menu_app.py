@@ -56,8 +56,28 @@ from .sounds import SoundManager
 
 logger = logging.getLogger("giga_dictate.menu_app")
 
+
+def _set_thread_qos_user_interactive():
+    """Sets current thread QoS to Darwin QOS_CLASS_USER_INTERACTIVE (0x21) for Performance cores scheduling."""
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc_name = ctypes.util.find_library("c")
+        if libc_name:
+            libc = ctypes.CDLL(libc_name)
+            # QOS_CLASS_USER_INTERACTIVE = 0x21
+            libc.pthread_set_qos_class_self_np(0x21, 0)
+    except Exception as e:
+        logger.debug(f"Could not set thread QoS: {e}")
+
+
 _WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaWorker")
-_PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaPreview")
+_PREVIEW_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="GigaPreview",
+    initializer=_set_thread_qos_user_interactive,
+)
 
 MODELS = [
     ("v3_e2e_ctc", "v3 E2E CTC (Рекомендуется, быстрый, пунктуация)"),
@@ -577,6 +597,8 @@ class MenuAppController(NSObject):
 
         if self.recorder.start():
             self._preview_session_id += 1
+            if hasattr(self.engine, "reset_preview_cache"):
+                self.engine.reset_preview_cache()
             logger.info("Audio recording started! Showing HUD.")
             self.update_status_title("Запись...", recording=True)
             self.sounds.play_start()
@@ -610,6 +632,8 @@ class MenuAppController(NSObject):
         logger.info("stop_and_transcribe executing on main thread")
         self._preview_session_id += 1
         self._stop_preview_timer()
+        if hasattr(self.engine, "reset_preview_cache"):
+            self.engine.reset_preview_cache()
         if not self.recorder.is_recording:
             logger.warning("stop_and_transcribe called, but recorder is not recording.")
             return
@@ -703,6 +727,7 @@ class MenuAppController(NSObject):
 
         def _preview_worker():
             try:
+                _set_thread_qos_user_interactive()
                 if not self.recorder.is_recording or session_id != getattr(self, "_preview_session_id", 0):
                     return
                 text = self.engine.transcribe_preview(snapshot)

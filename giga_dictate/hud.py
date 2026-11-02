@@ -12,7 +12,6 @@ from AppKit import (
     NSFontAttributeName,
     NSGradient,
     NSGraphicsContext,
-    NSLineBreakByTruncatingHead,
     NSLineBreakByWordWrapping,
     NSPanel,
     NSPoint,
@@ -25,7 +24,6 @@ from AppKit import (
     NSString,
     NSStringDrawingUsesFontLeading,
     NSStringDrawingUsesLineFragmentOrigin,
-    NSTextAlignmentCenter,
     NSTextAlignmentLeft,
     NSTextField,
     NSView,
@@ -540,6 +538,9 @@ class VoiceInputHUD(NSObject):
         self.glass_style = "glass"
         self._current_text = "..."
         self.text_font = NSFont.systemFontOfSize_weight_(13.5, 0.2)
+        self._anchor_center_x = None
+        self._anchor_top_y = None
+        self._measure_cache = {}
 
         self._create_panel()
         return self
@@ -612,38 +613,44 @@ class VoiceInputHUD(NSObject):
     def _update_layout(self):
         if self.live_preview_enabled:
             display_text = self._current_text or "..."
-            ns_str = NSString.stringWithString_(display_text)
-            attrs = {NSFontAttributeName: self.text_font}
-            single_sz = ns_str.sizeWithAttributes_(attrs)
-
             pad_left = 14.0
             pad_right = 38.0  # Room for bottom-right mini-waveform (26px + 12px margin)
-            min_w = PREVIEW_MIN_WIDTH
             max_w = PREVIEW_MAX_WIDTH
             base_h = PREVIEW_HEIGHT
 
-            if display_text == "..." or (
-                single_sz.width + pad_left + pad_right <= PREVIEW_WIDTH
-            ):
-                w = PREVIEW_WIDTH
-                h = base_h
-                text_h = math.ceil(single_sz.height)
-            elif single_sz.width + pad_left + pad_right <= max_w:
-                w = math.ceil(single_sz.width + pad_left + pad_right)
-                h = base_h
-                text_h = math.ceil(single_sz.height)
+            if display_text in self._measure_cache:
+                w, h, text_h = self._measure_cache[display_text]
             else:
-                w = max_w
-                avail_w = max_w - pad_left - pad_right
-                options = (
-                    NSStringDrawingUsesLineFragmentOrigin
-                    | NSStringDrawingUsesFontLeading
-                )
-                rect = ns_str.boundingRectWithSize_options_attributes_context_(
-                    NSSize(avail_w, 1200.0), options, attrs, None
-                )
-                text_h = math.ceil(rect.size.height)
-                h = max(base_h, text_h + 20.0)
+                ns_str = NSString.stringWithString_(display_text)
+                attrs = {NSFontAttributeName: self.text_font}
+                single_sz = ns_str.sizeWithAttributes_(attrs)
+
+                if display_text == "..." or (
+                    single_sz.width + pad_left + pad_right <= PREVIEW_WIDTH
+                ):
+                    w = PREVIEW_WIDTH
+                    h = base_h
+                    text_h = math.ceil(single_sz.height)
+                elif single_sz.width + pad_left + pad_right <= max_w:
+                    w = math.ceil(single_sz.width + pad_left + pad_right)
+                    h = base_h
+                    text_h = math.ceil(single_sz.height)
+                else:
+                    w = max_w
+                    avail_w = max_w - pad_left - pad_right
+                    options = (
+                        NSStringDrawingUsesLineFragmentOrigin
+                        | NSStringDrawingUsesFontLeading
+                    )
+                    rect = ns_str.boundingRectWithSize_options_attributes_context_(
+                        NSSize(avail_w, 1200.0), options, attrs, None
+                    )
+                    text_h = math.ceil(rect.size.height)
+                    h = max(base_h, text_h + 20.0)
+
+                if len(self._measure_cache) > 128:
+                    self._measure_cache.clear()
+                self._measure_cache[display_text] = (w, h, text_h)
 
             if self.container_view is not None:
                 self.container_view.setLivePreviewEnabled_(True)
@@ -700,7 +707,18 @@ class VoiceInputHUD(NSObject):
 
         if self.panel is not None:
             if self._is_visible:
-                new_pt = locate_caret_or_cursor(w, h)
+                if self._anchor_center_x is not None and self._anchor_top_y is not None:
+                    # Dynamically calculate HUD origin relative to cached anchor without blocking IPC
+                    target_x = self._anchor_center_x - (w / 2.0)
+                    target_y = self._anchor_top_y - h
+                    new_pt = locate_caret_or_cursor(
+                        w, h, target_pt=NSPoint(target_x, target_y)
+                    )
+                else:
+                    # Query Accessibility IPC once upon opening
+                    new_pt = locate_caret_or_cursor(w, h)
+                    self._anchor_center_x = new_pt.x + (w / 2.0)
+                    self._anchor_top_y = new_pt.y + h
                 self.panel.setFrame_display_(NSRect(new_pt, NSSize(w, h)), True)
             else:
                 cur_origin = self.panel.frame().origin
@@ -748,6 +766,8 @@ class VoiceInputHUD(NSObject):
                 logger.debug(f"Fade timer invalidation error: {e}")
             self._fade_timer = None
 
+        self._anchor_center_x = None
+        self._anchor_top_y = None
         self.state = "recording"
         self._is_visible = True
         self._current_text = "..."
@@ -781,6 +801,8 @@ class VoiceInputHUD(NSObject):
             return
         self._is_visible = False
         self.state = "idle"
+        self._anchor_center_x = None
+        self._anchor_top_y = None
         # Stop animation timer immediately to save CPU; AppKit animator handles window fade-out via GPU
         self._stop_timer()
 
@@ -803,6 +825,8 @@ class VoiceInputHUD(NSObject):
 
     def _onFadeDone_(self, timer):
         self._fade_timer = None
+        self._anchor_center_x = None
+        self._anchor_top_y = None
         if self._is_visible or self.state == "recording":
             return
         self._stop_timer()

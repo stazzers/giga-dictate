@@ -31,6 +31,13 @@ class GigaAMEngine:
         self._loaded_event = threading.Event()
         self._is_loaded = False
         self._load_error: str | None = None
+        self._last_preview_len: int = 0
+        self._last_preview_text: str = ""
+
+    def reset_preview_cache(self):
+        """Resets the VAD energy and preview transcription cache for a new recording session."""
+        self._last_preview_len = 0
+        self._last_preview_text = ""
 
     @property
     def is_loaded(self) -> bool:
@@ -233,6 +240,27 @@ class GigaAMEngine:
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32, copy=False)
 
+        # VAD Energy & Change Detection:
+        # If input audio is shorter than previous snapshot, a new recording started -> reset cache
+        if audio.size < self._last_preview_len:
+            self._last_preview_len = 0
+            self._last_preview_text = ""
+
+        # If audio length has not changed, reuse cached transcription immediately
+        if self._last_preview_len > 0 and audio.size == self._last_preview_len:
+            return self._last_preview_text
+
+        # If audio has accumulated and new delta slice is silence (< 0.003 RMS),
+        # reuse cached transcription immediately to avoid redundant GPU forward passes during speech pauses.
+        if self._last_preview_len > 0 and audio.size > self._last_preview_len:
+            delta = audio[self._last_preview_len:]
+            if delta.size > 0:
+                delta_energy = float(np.dot(delta, delta) / delta.size)
+                # Energy threshold 9e-6 corresponds to RMS ~ 0.003
+                if delta_energy < 9e-6:
+                    self._last_preview_len = audio.size
+                    return self._last_preview_text
+
         # Acquire lock non-blockingly so preview never stalls final transcription
         if not self._lock.acquire(blocking=False):
             return ""
@@ -268,7 +296,10 @@ class GigaAMEngine:
                         clean = clean.replace("⁇", "").replace("\ufffd", "").strip()
                         if clean:
                             clean = re.sub(r"\s+", " ", clean)
+                            self._last_preview_len = audio.size
+                            self._last_preview_text = clean
                             return clean
+                self._last_preview_len = audio.size
                 return ""
             else:
                 chunks = split_audio_into_chunks(audio, sr=sample_rate, max_sec=20.0)
@@ -299,9 +330,20 @@ class GigaAMEngine:
                 full = " ".join(parts).strip()
                 if full:
                     full = re.sub(r"\s+", " ", full)
+                self._last_preview_len = audio.size
+                self._last_preview_text = full
                 return full
         except Exception as e:
             logger.debug(f"Preview decode error: {e}")
+            if self.device_str == "mps" and ("MPS" in str(e) or "metal" in str(e).lower()):
+                logger.warning(f"MPS error during live preview ({e}). Falling back to CPU.")
+                try:
+                    if self.model is not None:
+                        self.model.to("cpu")
+                        self.model._device = torch.device("cpu")
+                    self.device_str = "cpu"
+                except Exception as fb_err:
+                    logger.debug(f"CPU fallback error: {fb_err}")
             return ""
         finally:
             del wav, length, encoded, encoded_len
