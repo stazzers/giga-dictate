@@ -34,7 +34,7 @@
 ### Вариант 1. Установка одной командой из терминала (Рекомендуется)
 Установка готового приложения в `/Applications` напрямую:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<ваш-аккаунт>/giga-dictate/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/stazzers/giga-dictate/main/install.sh | bash
 ```
 
 ### Вариант 2. Запуск приложения macOS

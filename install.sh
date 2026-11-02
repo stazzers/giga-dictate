@@ -13,7 +13,7 @@ TARGET_APP="$DEST_DIR/$APP_NAME"
 VOLUME_NAME="GigaDictate"
 
 # Default repo (can be overridden via environment variable GITHUB_REPO)
-REPO="${GITHUB_REPO:-ctazzerc/giga-dictate}"
+REPO="${GITHUB_REPO:-stazzers/giga-dictate}"
 RELEASE_URL="https://github.com/${REPO}/releases/latest/download/GigaDictate-arm64.dmg"
 
 echo "======================================================"
