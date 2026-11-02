@@ -7,20 +7,72 @@ APP_DIR="$DIR/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 
-echo "Building $APP_NAME in $DIR..."
+echo "================================================="
+echo " Building Standalone $APP_NAME (Apple Silicon)  "
+echo "================================================="
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
+mkdir -p "$FRAMEWORKS_DIR"
 
-# Copy Icon
+# 1. Copy Application Icon
 if [ -f "$DIR/AppIcon.icns" ]; then
     cp "$DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
     cp "$DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon"
 fi
 
-# Create Info.plist (identical structure to SuperDictate)
+# 2. Bundle Python Code & Repositories into Resources
+echo "Bundling Python modules into Resources..."
+cp -R "$DIR/giga_dictate" "$RESOURCES_DIR/giga_dictate"
+cp -R "$DIR/GigaAM_repo" "$RESOURCES_DIR/GigaAM_repo"
+# Clean __pycache__ from bundle
+find "$RESOURCES_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+# 3. Bundle Python.framework into Frameworks (standalone relocatable runtime)
+PYTHON_FW="/opt/homebrew/opt/python@3.11/Frameworks/Python.framework"
+if [ -d "$PYTHON_FW" ]; then
+    echo "Bundling Python.framework into Frameworks..."
+    cp -R "$PYTHON_FW" "$FRAMEWORKS_DIR/Python.framework"
+    # Prune unneeded development headers and test suites to optimize size
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Headers"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/include"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/share"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/test"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/ensurepip"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/idlelib"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/tkinter"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/Resources/Python.app"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/_CodeSignature"
+
+    # Establish standard macOS framework symlinks for codesign compliance
+    (
+        cd "$FRAMEWORKS_DIR/Python.framework/Versions" && ln -sf 3.11 Current
+        cd "$FRAMEWORKS_DIR/Python.framework" && ln -sf Versions/Current/Python Python
+        cd "$FRAMEWORKS_DIR/Python.framework" && ln -sf Versions/Current/Resources Resources
+    )
+    codesign -s - --force "$FRAMEWORKS_DIR/Python.framework/Versions/Current/Python"
+fi
+
+# 4. Bundle Virtualenv site-packages into Resources/venv
+if [ -d "$DIR/.venv" ]; then
+    echo "Bundling dependencies from .venv into Resources/venv..."
+    mkdir -p "$RESOURCES_DIR/venv/lib/python3.11"
+    cp -R "$DIR/.venv/lib/python3.11/site-packages" "$RESOURCES_DIR/venv/lib/python3.11/"
+    # Prune developer packages and test fixtures to optimize disk footprint
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/include"
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/testing"
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/bin"
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/pip"*
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/PyObjCTest"*
+    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/setuptools"*
+    find "$RESOURCES_DIR/venv" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# 5. Create Info.plist with exact permissions
+echo "Generating Info.plist..."
 cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,59 +114,31 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
 </plist>
 EOF
 
-# Compile native Mach-O launcher binary with embedded Python runtime
-PY_INCLUDES=$(/opt/homebrew/opt/python@3.11/bin/python3.11-config --includes)
-PY_LDFLAGS=$(/opt/homebrew/opt/python@3.11/bin/python3.11-config --ldflags --embed)
-clang -arch arm64 -O2 $PY_INCLUDES "$DIR/launcher.c" $PY_LDFLAGS -o "$MACOS_DIR/GigaDictate"
+# Standard macOS package signature
+echo -n 'APPL????' > "$CONTENTS_DIR/PkgInfo"
+
+# 6. Compile native Mach-O launcher binary linked to @rpath/Python.framework
+echo "Compiling native arm64 Mach-O launcher binary..."
+PY_INC="-I/opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/include/python3.11"
+PY_LIB="-L/opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/config-3.11-darwin -lpython3.11 -ldl -framework CoreFoundation"
+
+clang -arch arm64 -O2 $PY_INC \
+  $PY_LIB \
+  -Wl,-rpath,@executable_path/../Frameworks \
+  "$DIR/launcher.c" -o "$MACOS_DIR/GigaDictate"
+
+# Update dylib reference to @rpath so it loads the bundled framework on any Mac
+install_name_tool -change \
+  /opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/Python \
+  @rpath/Python.framework/Versions/3.11/Python \
+  "$MACOS_DIR/GigaDictate"
+
 chmod +x "$MACOS_DIR/GigaDictate"
 
-# Ad-hoc code sign the application bundle with permanent designated requirement and microphone entitlements
+# 7. Ad-hoc codesign application bundle with entitlements
+echo "Codesigning application bundle..."
 codesign -s - --force --deep --entitlements "$DIR/entitlements.plist" -r='designated => identifier "com.salute.gigadictate"' "$APP_DIR"
 
-echo "GigaDictate.app built and signed successfully at: $APP_DIR"
-
-# Install into /Applications
-echo "Installing into /Applications/GigaDictate.app..."
-rm -rf "/Applications/GigaDictate.app"
-cp -R "$APP_DIR" "/Applications/GigaDictate.app"
-codesign -s - --force --deep --entitlements "$DIR/entitlements.plist" -r='designated => identifier "com.salute.gigadictate"' "/Applications/GigaDictate.app"
-
-# Stamp white-toned icon directly into Finder metadata and flush LaunchServices cache
-"$DIR/.venv/bin/python" -c "
-import os, subprocess
-from AppKit import NSWorkspace, NSImage
-
-dir_path = '$DIR'
-icns_path = os.path.join(dir_path, 'AppIcon.icns')
-if os.path.exists(icns_path):
-    img = NSImage.alloc().initWithContentsOfFile_(icns_path)
-    for app in ['$APP_DIR', '/Applications/GigaDictate.app']:
-        if os.path.exists(app):
-            NSWorkspace.sharedWorkspace().setIcon_forFile_options_(img, app, 0)
-            subprocess.run(['touch', app])
-
-lsreg = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
-if os.path.exists(lsreg):
-    subprocess.run([lsreg, '-f', '-r', '/Applications/GigaDictate.app'])
-"
-
-# Invalidate and purge macOS Dock, Launchpad, and IconServices caches
-CACHE_DIR=$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || echo "")
-TEMP_DIR=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "")
-
-if [ -n "$CACHE_DIR" ]; then
-    rm -f "${CACHE_DIR}com.apple.dock.iconcache" 2>/dev/null || true
-    rm -rf "${CACHE_DIR}com.apple.iconservices"* 2>/dev/null || true
-fi
-
-if [ -n "$TEMP_DIR" ]; then
-    rm -rf "${TEMP_DIR}com.apple.iconservices"* 2>/dev/null || true
-fi
-
-# Re-register bundle in LaunchServices
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -r "/Applications/GigaDictate.app" 2>/dev/null || true
-
-# Refresh Finder and Dock so caches are reloaded from bundle resources
-killall Dock Finder 2>/dev/null || true
-
-echo "Installed successfully in /Applications/GigaDictate.app with updated white-toned icon!"
+echo "================================================="
+echo " Standalone bundle built successfully: $APP_DIR"
+echo "================================================="

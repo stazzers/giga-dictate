@@ -9,3 +9,5 @@ GigaAM_repo/
 GigaDictate.app/
 launcher
 *.log
+*.dmg
+build/
