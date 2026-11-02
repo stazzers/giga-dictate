@@ -46,6 +46,7 @@ elif [ -n "$LOCAL_DIR" ] && [ -d "$LOCAL_DIR/GigaDictate.app" ]; then
     pkill -x "GigaDictate" 2>/dev/null || true
     rm -rf "$TARGET_APP"
     cp -R "$LOCAL_DIR/GigaDictate.app" "$DEST_DIR/"
+    chmod -R u+w "$TARGET_APP" 2>/dev/null || true
     xattr -cr "$TARGET_APP" 2>/dev/null || true
     echo "✅ Приложение скопировано в $TARGET_APP"
     open "$TARGET_APP"
@@ -98,6 +99,7 @@ hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true
 
 # 7. Remove macOS quarantine flag for seamless launch
 echo "🛡️ Снятие атрибута карантина macOS (Gatekeeper)..."
+chmod -R u+w "$TARGET_APP" 2>/dev/null || true
 xattr -cr "$TARGET_APP" 2>/dev/null || true
 
 # 8. Launch App

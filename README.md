@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/stazzers/giga-dictate/main/install.
 3. Так как приложение распространяется как Open-Source без платного сертификата Apple Developer ID (\$99/год), macOS Gatekeeper при первом запуске покажет предупреждение о неизвестном разработчике.
    - **Быстро снять ограничение через Терминал**:
      ```bash
-     xattr -cr /Applications/GigaDictate.app
+     chmod -R u+w /Applications/GigaDictate.app && xattr -cr /Applications/GigaDictate.app
      ```
    - **Или через интерфейс macOS**:
      Перейдите в **«Системные настройки» → «Конфиденциальность и безопасность»** (System Settings → Privacy & Security), прокрутите вниз до раздела «Безопасность» и нажмите **«Подтвердить вход» / «Всё равно открыть»** (*Open Anyway*).

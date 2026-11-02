@@ -28,8 +28,10 @@ fi
 echo "Bundling Python modules into Resources..."
 cp -R "$DIR/giga_dictate" "$RESOURCES_DIR/giga_dictate"
 cp -R "$DIR/GigaAM_repo" "$RESOURCES_DIR/GigaAM_repo"
-# Clean __pycache__ from bundle
+# Clean .git and __pycache__ from bundle
+rm -rf "$RESOURCES_DIR/GigaAM_repo/.git"
 find "$RESOURCES_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+chmod -R u+w "$APP_DIR"
 
 # 3. Bundle Python.framework into Frameworks (standalone relocatable runtime)
 PYTHON_FW="/opt/homebrew/opt/python@3.11/Frameworks/Python.framework"
