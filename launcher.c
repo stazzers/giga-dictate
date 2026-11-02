@@ -1,7 +1,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <mach-o/dyld.h>
-#include <libgen.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -26,15 +25,16 @@ int main(int argc, char *argv[]) {
 
     // 2. Derive bundle directory hierarchy
     // resolved_exe: <AppDir>/Contents/MacOS/GigaDictate
-    char macos_dir[PATH_MAX];
-    strncpy(macos_dir, resolved_exe, sizeof(macos_dir) - 1);
-    macos_dir[sizeof(macos_dir) - 1] = '\0';
-    dirname(macos_dir);
-
     char contents_dir[PATH_MAX];
-    strncpy(contents_dir, macos_dir, sizeof(contents_dir) - 1);
+    strncpy(contents_dir, resolved_exe, sizeof(contents_dir) - 1);
     contents_dir[sizeof(contents_dir) - 1] = '\0';
-    dirname(contents_dir);
+
+    // Strip binary name (e.g. /GigaDictate)
+    char *p = strrchr(contents_dir, '/');
+    if (p) *p = '\0';
+    // Strip MacOS directory (e.g. /MacOS)
+    p = strrchr(contents_dir, '/');
+    if (p) *p = '\0';
 
     char resources_dir[PATH_MAX];
     snprintf(resources_dir, sizeof(resources_dir), "%s/Resources", contents_dir);
@@ -49,8 +49,11 @@ int main(int argc, char *argv[]) {
     char bundled_site[PATH_MAX];
     snprintf(bundled_site, sizeof(bundled_site), "%s/venv/lib/python3.11/site-packages", resources_dir);
 
+    char bundled_pkg[PATH_MAX];
+    snprintf(bundled_pkg, sizeof(bundled_pkg), "%s/giga_dictate", resources_dir);
+
     struct stat st;
-    int is_bundled = (stat(bundled_site, &st) == 0);
+    int is_bundled = (stat(bundled_pkg, &st) == 0);
 
     // 4. Configure environment
     setenv("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
@@ -61,9 +64,13 @@ int main(int argc, char *argv[]) {
         setenv("PYTHONHOME", bundled_py_home, 1);
         chdir(resources_dir);
     } else {
-        // Local repo fallback
-        const char *project_dir = "/Users/ctazzerc/Projects/Giga dictate";
-        chdir(project_dir);
+        // Fallback for running `./launcher` directly from local repo
+        char repo_dir[PATH_MAX];
+        strncpy(repo_dir, resolved_exe, sizeof(repo_dir) - 1);
+        repo_dir[sizeof(repo_dir) - 1] = '\0';
+        char *slash = strrchr(repo_dir, '/');
+        if (slash) *slash = '\0';
+        chdir(repo_dir);
     }
 
     // 5. Initialize embedded Python 3.11 runtime
@@ -76,7 +83,8 @@ int main(int argc, char *argv[]) {
             "import sys, site, os\n"
             "res = '%s'\n"
             "site_dir = '%s'\n"
-            "site.addsitedir(site_dir)\n"
+            "if os.path.exists(site_dir):\n"
+            "    site.addsitedir(site_dir)\n"
             "gigaam = os.path.join(res, 'GigaAM_repo')\n"
             "for p in [res, gigaam]:\n"
             "    if os.path.exists(p) and p not in sys.path:\n"
@@ -84,14 +92,22 @@ int main(int argc, char *argv[]) {
             resources_dir, bundled_site
         );
     } else {
+        char repo_dir[PATH_MAX];
+        strncpy(repo_dir, resolved_exe, sizeof(repo_dir) - 1);
+        repo_dir[sizeof(repo_dir) - 1] = '\0';
+        char *slash = strrchr(repo_dir, '/');
+        if (slash) *slash = '\0';
+
         snprintf(bootstrap, sizeof(bootstrap),
             "import sys, site, os\n"
-            "proj_dir = '/Users/ctazzerc/Projects/Giga dictate'\n"
+            "proj_dir = '%s'\n"
             "venv_dir = os.path.join(proj_dir, '.venv')\n"
             "site_packages = os.path.join(venv_dir, 'lib', 'python3.11', 'site-packages')\n"
-            "site.addsitedir(site_packages)\n"
+            "if os.path.exists(site_packages):\n"
+            "    site.addsitedir(site_packages)\n"
             "if proj_dir not in sys.path:\n"
-            "    sys.path.insert(0, proj_dir)\n"
+            "    sys.path.insert(0, proj_dir)\n",
+            repo_dir
         );
     }
 
