@@ -65,10 +65,7 @@ chflags hidden "$VOLUME_PATH/.background" 2>/dev/null || true
 
 # 6. Configure compact Finder window (large 120px icons, pure white background, App on left, Apps on right)
 echo "Configuring Finder window geometry and icon layout..."
-python3 - << 'PYEOF' 2>/dev/null || echo "Finder window customization skipped (permission or headless environment)."
-import subprocess
-
-script = '''
+osascript << 'EOF'
 tell application "Finder"
     tell disk "GigaDictate"
         open
@@ -90,15 +87,10 @@ tell application "Finder"
         close
         open
         update without registering applications
-        delay 1
+        delay 2
     end tell
 end tell
-'''
-try:
-    subprocess.run(["osascript", "-e", script], timeout=8, capture_output=True, check=True)
-except Exception:
-    pass
-PYEOF
+EOF
 
 # Ensure changes are flushed to disk
 echo "Flushing volume changes..."

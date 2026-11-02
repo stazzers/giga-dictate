@@ -30,7 +30,7 @@ class TestMenuAppUI(unittest.TestCase):
         self.assertTrue(any("Готов" in t or "Загрузка" in t or "Запись" in t for t in titles))
         self.assertTrue(any("запись" in t.lower() for t in titles))
         self.assertTrue(any("Модель GigaAM" in t for t in titles))
-        self.assertTrue(any("Устройство ускорения" in t for t in titles))
+        self.assertFalse(any("Устройство ускорения" in t for t in titles))
         self.assertTrue(any("Режим вызова клавиши" in t for t in titles))
         self.assertTrue(any("Горячая клавиша" in t for t in titles))
         self.assertTrue(any("Звуковые сигналы" in t for t in titles))

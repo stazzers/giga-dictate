@@ -292,24 +292,7 @@ class MenuAppController(NSObject):
         model_menu_item.setSubmenu_(model_sub)
         menu.addItem_(model_menu_item)
 
-        # 4. Device Submenu
-        device_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Устройство ускорения", None, ""
-        )
-        device_sub = NSMenu.alloc().init()
-        for d_id, d_label in DEVICES:
-            d_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                d_label, "onSelectDevice:", ""
-            )
-            d_item.setTarget_(self)
-            d_item.setRepresentedObject_(d_id)
-            if self.config.device == d_id:
-                d_item.setState_(1)
-            device_sub.addItem_(d_item)
-        device_menu_item.setSubmenu_(device_sub)
-        menu.addItem_(device_menu_item)
-
-        # 5. Hotkey Mode Submenu
+        # 4. Hotkey Mode Submenu
         mode_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Режим вызова клавиши", None, ""
         )
@@ -366,7 +349,7 @@ class MenuAppController(NSObject):
 
         # 3. Configure / change hotkey
         record_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "✏️ Изменить клавишу...", "onCustomHotkeyDialog:", ""
+            "Изменить клавишу...", "onCustomHotkeyDialog:", ""
         )
         record_item.setTarget_(self)
         hotkey_sub.addItem_(record_item)
@@ -376,34 +359,34 @@ class MenuAppController(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        # 7. Preferences Checkboxes
+        # 6. Preferences Checkboxes
         sound_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "🔊 Звуковые сигналы", "onToggleSound:", ""
+            "Звуковые сигналы", "onToggleSound:", ""
         )
         sound_item.setTarget_(self)
         sound_item.setState_(1 if self.config.sound_feedback else 0)
         menu.addItem_(sound_item)
 
         space_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "␣ Добавлять пробел после текста", "onToggleSpace:", ""
+            "Добавлять пробел после текста", "onToggleSpace:", ""
         )
         space_item.setTarget_(self)
         space_item.setState_(1 if self.config.add_trailing_space else 0)
         menu.addItem_(space_item)
 
         login_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "🚀 Запуск при старте системы", "onToggleLaunchAtLogin:", ""
+            "Запуск при старте системы", "onToggleLaunchAtLogin:", ""
         )
         login_item.setTarget_(self)
         login_item.setState_(1 if is_launch_at_login_enabled() else 0)
         menu.addItem_(login_item)
 
-        # 8. Check Permissions
+        # 7. Check Permissions
         perm_has = TextInserter.is_accessibility_granted()
         perm_label = (
-            "🛡️ Универсальный доступ: Разрешено"
+            "Универсальный доступ: Разрешено"
             if perm_has
-            else "⚠️ Разрешить Универсальный доступ (Вставка)"
+            else "Разрешить Универсальный доступ (Вставка)"
         )
         perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             perm_label, "onCheckPermissions:", ""
@@ -413,7 +396,7 @@ class MenuAppController(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        # 9. About, Uninstall & Quit
+        # 8. About, Uninstall & Quit
         about_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "О программе GigaDictate...", "onAboutDialog:", ""
         )
@@ -421,7 +404,7 @@ class MenuAppController(NSObject):
         menu.addItem_(about_item)
 
         uninstall_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "🗑️ Полное удаление...", "onUninstallAppDialog:", ""
+            "Полное удаление...", "onUninstallAppDialog:", ""
         )
         uninstall_item.setTarget_(self)
         menu.addItem_(uninstall_item)
