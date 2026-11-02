@@ -40,7 +40,7 @@ from Foundation import NSBundle, NSObject, NSTimer
 from PyObjCTools import AppHelper
 
 from .audio import AudioRecorder
-from .config import AppConfig
+from .config import AppConfig, is_launch_at_login_enabled, set_launch_at_login
 from .engine import GigaAMEngine
 from .hotkey import (
     MODIFIER_MASKS,
@@ -390,6 +390,13 @@ class MenuAppController(NSObject):
         space_item.setTarget_(self)
         space_item.setState_(1 if self.config.add_trailing_space else 0)
         menu.addItem_(space_item)
+
+        login_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "🚀 Запуск при старте системы", "onToggleLaunchAtLogin:", ""
+        )
+        login_item.setTarget_(self)
+        login_item.setState_(1 if is_launch_at_login_enabled() else 0)
+        menu.addItem_(login_item)
 
         # 8. Check Permissions
         perm_has = TextInserter.is_accessibility_granted()
@@ -793,6 +800,14 @@ class MenuAppController(NSObject):
         self.config.save()
         self.rebuild_menu()
 
+    def onToggleLaunchAtLogin_(self, sender):
+        current = is_launch_at_login_enabled()
+        new_val = not current
+        set_launch_at_login(new_val)
+        self.config.launch_at_login = new_val
+        self.config.save()
+        self.rebuild_menu()
+
     def onCheckPermissions_(self, sender):
         if not TextInserter.is_accessibility_granted():
             alert = NSAlert.alloc().init()
@@ -898,7 +913,8 @@ tccutil reset ListenEvent "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset SpeechRecognition "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset All "$BUNDLE_ID" 2>/dev/null || true
 
-# Purge config, logs and ~900MB neural network cache
+# Purge config, logs, launch agents and ~900MB neural network cache
+rm -f "$HOME/Library/LaunchAgents/com.salute.gigadictate.plist" 2>/dev/null || true
 rm -rf "$HOME/.config/giga_dictate"
 rm -rf "$HOME/.cache/gigaam"
 rm -f "$HOME/Library/Logs/DiagnosticReports/GigaDictate"* 2>/dev/null || true

@@ -35,11 +35,13 @@ class TestMenuAppUI(unittest.TestCase):
         self.assertTrue(any("Горячая клавиша" in t for t in titles))
         self.assertTrue(any("Звуковые сигналы" in t for t in titles))
         self.assertTrue(any("Добавлять пробел" in t for t in titles))
+        self.assertTrue(any("Запуск при старте" in t for t in titles))
         self.assertTrue(any("Универсальный доступ" in t for t in titles))
         self.assertTrue(any("полное удаление" in t.lower() for t in titles))
         self.assertTrue(any("Завершить" in t for t in titles))
         self.assertTrue(hasattr(controller, "onUninstallAppDialog_"))
         self.assertTrue(hasattr(controller, "execute_complete_uninstallation"))
+        self.assertTrue(hasattr(controller, "onToggleLaunchAtLogin_"))
 
     def test_hotkey_three_line_submenu(self):
         controller = MenuAppController.alloc().init()
@@ -109,6 +111,27 @@ class TestMenuAppUI(unittest.TestCase):
         controller.update_status_title("", recording=False)
         self.assertEqual(btn.title(), "")
         self.assertEqual(btn.image(), controller.menu_icon)
+
+    def test_launch_at_login_toggle(self):
+        controller = MenuAppController.alloc().init()
+        from giga_dictate.config import is_launch_at_login_enabled, set_launch_at_login
+
+        try:
+            # Ensure starts clean
+            set_launch_at_login(False)
+            self.assertFalse(is_launch_at_login_enabled())
+
+            # Toggle on
+            controller.onToggleLaunchAtLogin_(None)
+            self.assertTrue(is_launch_at_login_enabled())
+            self.assertTrue(controller.config.launch_at_login)
+
+            # Toggle off
+            controller.onToggleLaunchAtLogin_(None)
+            self.assertFalse(is_launch_at_login_enabled())
+            self.assertFalse(controller.config.launch_at_login)
+        finally:
+            set_launch_at_login(False)
 
 
 if __name__ == "__main__":

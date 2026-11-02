@@ -37,8 +37,9 @@ tccutil reset ListenEvent "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset SpeechRecognition "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset All "$BUNDLE_ID" 2>/dev/null || true
 
-# 5. Очистка конфигурации и кэша моделей нейросети (~900 МБ)
-echo "5. Очистка конфигурации и кэша моделей..."
+# 5. Очистка автозагрузки, конфигурации и кэша моделей нейросети (~900 МБ)
+echo "5. Очистка автозагрузки, конфигурации и кэша моделей..."
+rm -f "$HOME/Library/LaunchAgents/com.salute.gigadictate.plist" 2>/dev/null || true
 rm -rf "$HOME/.config/giga_dictate"
 rm -rf "$HOME/.cache/gigaam"
 

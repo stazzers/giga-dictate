@@ -6,6 +6,64 @@ from dataclasses import asdict, dataclass, field
 
 CONFIG_DIR = os.path.expanduser("~/.config/giga_dictate")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+LAUNCH_AGENT_DIR = os.path.expanduser("~/Library/LaunchAgents")
+LAUNCH_AGENT_PLIST = os.path.join(LAUNCH_AGENT_DIR, "com.salute.gigadictate.plist")
+
+
+def is_launch_at_login_enabled() -> bool:
+    """Checks whether the launch agent plist exists in user's Library."""
+    return os.path.exists(LAUNCH_AGENT_PLIST)
+
+
+def set_launch_at_login(enabled: bool) -> bool:
+    """Enables or disables auto-launch at macOS login via user LaunchAgent."""
+    if not enabled:
+        try:
+            if os.path.exists(LAUNCH_AGENT_PLIST):
+                os.remove(LAUNCH_AGENT_PLIST)
+            return True
+        except OSError:
+            return False
+
+    app_path = "/Applications/GigaDictate.app"
+    try:
+        from Foundation import NSBundle
+
+        bundle = NSBundle.mainBundle()
+        if bundle:
+            b_path = bundle.bundlePath()
+            if b_path and b_path.endswith(".app") and os.path.exists(b_path):
+                app_path = b_path
+    except (ImportError, AttributeError):
+        pass
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.salute.gigadictate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>{app_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"""
+    try:
+        os.makedirs(LAUNCH_AGENT_DIR, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(LAUNCH_AGENT_PLIST, flags, 0o644)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(plist_content)
+        return True
+    except OSError:
+        return False
 
 
 def get_default_device() -> str:
@@ -39,6 +97,7 @@ class AppConfig:
     audio_device: int | None = None
     show_settings_on_launch: bool = False
     custom_hotkey: str | None = None
+    launch_at_login: bool = False
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -51,6 +110,7 @@ class AppConfig:
                 )
                 if config.custom_hotkey is None and config.hotkey != "right_cmd":
                     config.custom_hotkey = config.hotkey
+                config.launch_at_login = is_launch_at_login_enabled()
                 return config
             except Exception as e:
                 print(
