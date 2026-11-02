@@ -4,32 +4,54 @@ set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 APP_NAME="GigaDictate.app"
 APP_DIR="$DIR/$APP_NAME"
-DMG_NAME="GigaDictate-arm64.dmg"
-DMG_PATH="$DIR/$DMG_NAME"
-STAGING_DIR="$DIR/build/dmg_staging"
+FINAL_DMG="$DIR/GigaDictate-arm64.dmg"
+TEMP_DMG="$DIR/build/temp_rw.dmg"
+BUILD_DIR="$DIR/build"
 
 echo "================================================="
-echo " Creating GigaDictate DMG for Apple Silicon      "
+echo " Creating Professional macOS DMG for GigaDictate "
 echo "================================================="
 
-# 1. Ensure GigaDictate.app is built
+# 1. Ensure GigaDictate.app is built and valid
 if [ ! -d "$APP_DIR" ]; then
     echo "GigaDictate.app not found. Building it first..."
     bash "$DIR/scripts/create_app.sh"
 fi
 
-# 2. Prepare DMG staging directory
-rm -rf "$DIR/build" "$DMG_PATH"
-mkdir -p "$STAGING_DIR"
+rm -rf "$BUILD_DIR" "$FINAL_DMG"
+mkdir -p "$BUILD_DIR"
 
-echo "Copying GigaDictate.app to staging..."
-cp -R "$APP_DIR" "$STAGING_DIR/"
+# 2. Generate Retina background image
+echo "Generating DMG window background image..."
+"$DIR/.venv/bin/python" "$DIR/scripts/generate_dmg_background.py"
+
+# 3. Create temporary writable DMG (2500MB allows ample staging room before compression)
+echo "Creating temporary writable DMG image..."
+hdiutil create -size 2500m -fs HFS+ -volname "GigaDictate" -ov "$TEMP_DMG"
+
+# 4. Mount temporary DMG
+echo "Mounting temporary DMG..."
+MOUNT_OUTPUT=$(hdiutil attach -readwrite -noverify -noautoopen "$TEMP_DMG")
+DEV_NAME=$(echo "$MOUNT_OUTPUT" | awk '/\/dev\/disk/ {print $1; exit}')
+VOLUME_PATH=$(echo "$MOUNT_OUTPUT" | grep "/Volumes/" | awk '{print $NF}')
+
+echo "Volume mounted at: $VOLUME_PATH (Device: $DEV_NAME)"
+sleep 1
+
+# 5. Populate volume contents
+echo "Copying GigaDictate.app into volume..."
+cp -R "$APP_DIR" "$VOLUME_PATH/"
 
 echo "Creating Applications shortcut..."
-ln -s /Applications "$STAGING_DIR/Applications"
+ln -s /Applications "$VOLUME_PATH/Applications"
 
-# 3. Create uninstaller script
-cat << 'EOF' > "$STAGING_DIR/Uninstall GigaDictate.command"
+echo "Adding background image..."
+mkdir -p "$VOLUME_PATH/.background"
+cp "$BUILD_DIR/background.png" "$VOLUME_PATH/.background/background.png"
+chflags hidden "$VOLUME_PATH/.background" 2>/dev/null || true
+
+echo "Adding uninstaller and instructions..."
+cat << 'EOF' > "$VOLUME_PATH/Uninstall GigaDictate.command"
 #!/bin/bash
 clear
 echo "======================================================"
@@ -72,10 +94,9 @@ echo "          Удаление завершено успешно!             
 echo "======================================================"
 echo "Вы можете закрыть это окно терминала."
 EOF
-chmod +x "$STAGING_DIR/Uninstall GigaDictate.command"
+chmod +x "$VOLUME_PATH/Uninstall GigaDictate.command"
 
-# 4. Create README instruction file
-cat << 'EOF' > "$STAGING_DIR/Инструкция по установке.txt"
+cat << 'EOF' > "$VOLUME_PATH/Инструкция по установке.txt"
 ======================================================
            УСТАНОВКА GIGADICTATE ДЛЯ MACOS            
 ======================================================
@@ -103,19 +124,54 @@ cat << 'EOF' > "$STAGING_DIR/Инструкция по установке.txt"
 Приятного использования высокоскоростной локальной диктовки GigaAM-v3!
 EOF
 
-# 5. Build compressed DMG
-echo "Generating DMG image via hdiutil..."
-hdiutil create \
-  -volname "GigaDictate" \
-  -srcfolder "$STAGING_DIR" \
-  -ov \
-  -format UDZO \
-  "$DMG_PATH"
+# 6. Configure Finder window appearance & icon coordinates via AppleScript
+echo "Configuring Finder window geometry and icon layout..."
+osascript << 'EOF'
+tell application "Finder"
+    tell disk "GigaDictate"
+        open
+        delay 1
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set the bounds of container window to {300, 150, 860, 510}
+        
+        set theViewOptions to the icon view options of container window
+        set arrangement of theViewOptions to not arranged
+        set icon size of theViewOptions to 96
+        set text size of theViewOptions to 12
+        set background picture of theViewOptions to file ".background:background.png"
+        
+        set position of item "GigaDictate.app" of container window to {140, 175}
+        set position of item "Applications" of container window to {420, 175}
+        set position of item "Uninstall GigaDictate.command" of container window to {170, 305}
+        set position of item "Инструкция по установке.txt" of container window to {390, 305}
+        
+        close
+        open
+        update without registering applications
+        delay 2
+    end tell
+end tell
+EOF
 
-# Clean staging build folder
-rm -rf "$DIR/build"
+# Ensure changes are flushed to disk
+echo "Flushing volume changes..."
+sync
+sleep 2
+
+# 7. Unmount volume
+echo "Detaching temporary volume..."
+hdiutil detach "$DEV_NAME"
+
+# 8. Convert to final read-only, compressed DMG
+echo "Compressing into final read-only DMG (UDZO zlib-level 9)..."
+hdiutil convert "$TEMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$FINAL_DMG"
+
+# 9. Clean up temporary files
+rm -rf "$BUILD_DIR"
 
 echo "================================================="
-echo " DMG created successfully at: $DMG_PATH"
-du -sh "$DMG_PATH"
+echo " Final DMG created successfully at: $FINAL_DMG"
+du -sh "$FINAL_DMG"
 echo "================================================="
