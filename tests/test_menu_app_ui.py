@@ -134,5 +134,37 @@ class TestMenuAppUI(unittest.TestCase):
             set_launch_at_login(False)
 
 
+    def test_load_menu_icon_retina_multi_representation(self):
+        import os
+        from giga_dictate.menu_app import _load_menu_icon
+
+        res_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "giga_dictate",
+            "resources",
+        )
+        icon_path = os.path.join(res_dir, "menu_icon.png")
+        rec_path = os.path.join(res_dir, "menu_icon_rec.png")
+
+        # 1. Non-existent path returns None
+        self.assertIsNone(_load_menu_icon("/non/existent/path.png"))
+
+        # 2. Template icon loads multi-rep Retina representations
+        img = _load_menu_icon(icon_path, is_template=True)
+        self.assertIsNotNone(img)
+        self.assertTrue(img.isTemplate())
+        self.assertEqual(img.size().width, 11.0)
+        self.assertEqual(img.size().height, 18.0)
+        self.assertGreaterEqual(len(img.representations()), 2)
+
+        # 3. Recording icon loads with full color and non-template
+        rec_img = _load_menu_icon(rec_path, is_template=False)
+        self.assertIsNotNone(rec_img)
+        self.assertFalse(rec_img.isTemplate())
+        self.assertEqual(rec_img.size().width, 11.0)
+        self.assertEqual(rec_img.size().height, 18.0)
+        self.assertGreaterEqual(len(rec_img.representations()), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

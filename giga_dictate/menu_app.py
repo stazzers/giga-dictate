@@ -12,6 +12,7 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
+    NSBitmapImageRep,
     NSButton,
     NSColor,
     NSEvent,
@@ -97,6 +98,35 @@ DEVICES = [
 ]
 
 
+def _load_menu_icon(path_1x: str, is_template: bool = False) -> NSImage | None:
+    """Loads a menu icon supporting both 1x and @2x Retina representations."""
+    if not os.path.exists(path_1x):
+        return None
+
+    rep_1x = NSBitmapImageRep.imageRepWithContentsOfFile_(path_1x)
+    if not rep_1x:
+        return None
+
+    width_pt = rep_1x.pixelsWide()
+    height_pt = rep_1x.pixelsHigh()
+    rep_1x.setSize_(NSSize(width_pt, height_pt))
+
+    img = NSImage.alloc().initWithSize_(NSSize(width_pt, height_pt))
+    img.addRepresentation_(rep_1x)
+
+    base, ext = os.path.splitext(path_1x)
+    path_2x = f"{base}@2x{ext}"
+    if os.path.exists(path_2x):
+        rep_2x = NSBitmapImageRep.imageRepWithContentsOfFile_(path_2x)
+        if rep_2x:
+            rep_2x.setSize_(NSSize(width_pt, height_pt))
+            img.addRepresentation_(rep_2x)
+
+    if is_template:
+        img.setTemplate_(True)
+    return img
+
+
 class CaptureWindowDelegate(NSObject):
     def initWithController_(self, controller):
         self = objc.super(CaptureWindowDelegate, self).init()
@@ -176,17 +206,14 @@ class MenuAppController(NSObject):
         self.status_item.setVisible_(True)
         _GLOBAL_STATUS_ITEMS.append(self.status_item)
 
-        # Load menu icons from resources
+        # Load menu icons from resources (multi-representation for sharp Retina rendering)
         res_dir = os.path.join(os.path.dirname(__file__), "resources")
-        icon_path = os.path.join(res_dir, "menu_icon.png")
-        if os.path.exists(icon_path):
-            self.menu_icon = NSImage.alloc().initWithContentsOfFile_(icon_path)
-            if self.menu_icon:
-                self.menu_icon.setTemplate_(True)
-
-        rec_icon_path = os.path.join(res_dir, "menu_icon_rec.png")
-        if os.path.exists(rec_icon_path):
-            self.menu_icon_rec = NSImage.alloc().initWithContentsOfFile_(rec_icon_path)
+        self.menu_icon = _load_menu_icon(
+            os.path.join(res_dir, "menu_icon.png"), is_template=True
+        )
+        self.menu_icon_rec = _load_menu_icon(
+            os.path.join(res_dir, "menu_icon_rec.png"), is_template=False
+        )
 
         btn = self.status_item.button()
         if btn:

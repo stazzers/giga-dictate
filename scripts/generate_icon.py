@@ -154,31 +154,55 @@ def generate_all_icons():
     res_dir = os.path.join(root, "giga_dictate", "resources")
     os.makedirs(res_dir, exist_ok=True)
 
-    # Black template icon for macOS Menu Bar
     crop_alpha = cropped.split()[3]
-    black_arr = np.zeros((cropped.height, cropped.width, 4), dtype=np.uint8)
-    black_arr[:, :, 3] = np.array(crop_alpha)
-    black_src = Image.fromarray(black_arr)
-
     h_2x = 36
     w_2x = int(cropped.width * (h_2x / cropped.height))
     h_1x = 18
     w_1x = int(cropped.width * (h_1x / cropped.height))
 
-    black_src.resize((w_1x, h_1x), Image.Resampling.LANCZOS).save(os.path.join(res_dir, "menu_icon.png"))
-    black_src.resize((w_2x, h_2x), Image.Resampling.LANCZOS).save(os.path.join(res_dir, "menu_icon@2x.png"))
+    # Dilate stroke contours before downscaling to prevent thin pen strokes
+    # from fading or averaging out at small point sizes (18px/36px)
+    mask_dilated = crop_alpha.filter(ImageFilter.MaxFilter(5))
+    r2 = np.array(mask_dilated.resize((w_2x, h_2x), Image.Resampling.LANCZOS)).astype(np.float32)
+    r1 = np.array(mask_dilated.resize((w_1x, h_1x), Image.Resampling.LANCZOS)).astype(np.float32)
 
-    # Red recording icon for active state
-    red_arr = np.zeros((cropped.height, cropped.width, 4), dtype=np.uint8)
-    red_arr[:, :, 0] = 255
-    red_arr[:, :, 1] = 59
-    red_arr[:, :, 2] = 48
-    red_arr[:, :, 3] = np.array(crop_alpha)
-    red_src = Image.fromarray(red_arr)
+    # Smoothstep contrast boost ensuring stroke cores reach solid 100% opacity
+    # while preserving smooth anti-aliased edge contours and eliminating background haze
+    t_2x = np.clip((r2 - 6.0) / (70.0 - 6.0), 0.0, 1.0)
+    alpha_2x = ((t_2x * t_2x * (3.0 - 2.0 * t_2x)) * 255.0).astype(np.uint8)
 
-    red_src.resize((w_1x, h_1x), Image.Resampling.LANCZOS).save(os.path.join(res_dir, "menu_icon_rec.png"))
-    red_src.resize((w_2x, h_2x), Image.Resampling.LANCZOS).save(os.path.join(res_dir, "menu_icon_rec@2x.png"))
-    print("Menu bar icons generated in giga_dictate/resources/")
+    t_1x = np.clip((r1 - 6.0) / (45.0 - 6.0), 0.0, 1.0)
+    alpha_1x = ((t_1x * t_1x * (3.0 - 2.0 * t_1x)) * 255.0).astype(np.uint8)
+
+    # Black template icon for macOS Menu Bar (pure black RGB; macOS inverts to crisp solid white in Dark Mode)
+    black_1x = np.zeros((h_1x, w_1x, 4), dtype=np.uint8)
+    black_1x[:, :, 3] = alpha_1x
+    black_1x_path = os.path.join(res_dir, "menu_icon.png")
+    Image.fromarray(black_1x).save(black_1x_path)
+
+    black_2x = np.zeros((h_2x, w_2x, 4), dtype=np.uint8)
+    black_2x[:, :, 3] = alpha_2x
+    black_2x_path = os.path.join(res_dir, "menu_icon@2x.png")
+    Image.fromarray(black_2x).save(black_2x_path)
+
+    # Vivid Apple System Red recording icon for active state
+    red_1x = np.zeros((h_1x, w_1x, 4), dtype=np.uint8)
+    red_1x[:, :, 0] = 255
+    red_1x[:, :, 1] = 45
+    red_1x[:, :, 2] = 55
+    red_1x[:, :, 3] = alpha_1x
+    red_1x_path = os.path.join(res_dir, "menu_icon_rec.png")
+    Image.fromarray(red_1x).save(red_1x_path)
+
+    red_2x = np.zeros((h_2x, w_2x, 4), dtype=np.uint8)
+    red_2x[:, :, 0] = 255
+    red_2x[:, :, 1] = 45
+    red_2x[:, :, 2] = 55
+    red_2x[:, :, 3] = alpha_2x
+    red_2x_path = os.path.join(res_dir, "menu_icon_rec@2x.png")
+    Image.fromarray(red_2x).save(red_2x_path)
+
+    print(f"Menu bar icons generated in {res_dir}")
 
 
 if __name__ == "__main__":
