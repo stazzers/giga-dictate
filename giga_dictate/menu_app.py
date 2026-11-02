@@ -31,10 +31,12 @@ from AppKit import (
     NSStatusBar,
     NSTextAlignmentCenter,
     NSTextField,
+    NSURL,
     NSVariableStatusItemLength,
     NSWindow,
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskTitled,
+    NSWorkspace,
 )
 from Foundation import NSBundle, NSObject, NSTimer
 from PyObjCTools import AppHelper
@@ -184,19 +186,11 @@ class MenuAppController(NSObject):
 
     def onCheckPermissionsTick_(self, timer):
         """Periodically checks if user granted Accessibility and connects event tap automatically."""
-        if TextInserter.is_accessibility_granted():
-            if self.hotkey_listener._tap is None:
+        if self.hotkey_listener._tap is None:
+            if self.hotkey_listener.start():
                 logger.info(
-                    "Accessibility granted by user! Activating hotkey listener..."
+                    "Accessibility active: Event tap successfully connected! Rebuilding menu..."
                 )
-                self.hotkey_listener.start()
-            if self.hotkey_listener._tap is not None:
-                if self._perm_check_timer is not None:
-                    try:
-                        self._perm_check_timer.invalidate()
-                    except (AttributeError, RuntimeError) as e:
-                        logger.debug(f"Timer invalidate error: {e}")
-                    self._perm_check_timer = None
                 self.rebuild_menu()
 
     def _on_model_progress(self, downloaded, total):
@@ -295,14 +289,19 @@ class MenuAppController(NSObject):
             status_text = f"⚠️ Ошибка: {self._model_error[:40]}"
         elif not self.engine.is_loaded:
             status_text = f"⏳ {self._model_progress_str or 'Загрузка модели GigaAM-v3...'}"
+        elif self.hotkey_listener._tap is None:
+            status_text = "⚠️ Клавиша не активна (нужен доступ в Настройках)"
         else:
             mode_desc = (
                 "Удерживайте"
                 if self.config.hotkey_mode == "push_to_talk"
                 else "Нажмите"
             )
+            hk_label = get_hotkey_display_name(self.config.hotkey)
+            if self.config.hotkey == "right_cmd":
+                hk_label = "ПРАВЫЙ Command (кнопка ⌘ справа от пробела)"
             status_text = (
-                f"🟢 Готов к вводу ({mode_desc} {get_hotkey_display_name(self.config.hotkey)})"
+                f"🟢 Готов к вводу ({mode_desc} {hk_label})"
             )
 
         status_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -318,6 +317,13 @@ class MenuAppController(NSObject):
             )
             retry_item.setTarget_(self)
             menu.addItem_(retry_item)
+
+        if self.hotkey_listener._tap is None and self.engine.is_loaded and not self._model_error:
+            fix_perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "👉 Активировать перехват клавиши в Настройках macOS...", "onFixAccessibility:", ""
+            )
+            fix_perm_item.setTarget_(self)
+            menu.addItem_(fix_perm_item)
 
         # 2. Manual toggle recording
         action_title = (
@@ -440,11 +446,11 @@ class MenuAppController(NSObject):
         menu.addItem_(login_item)
 
         # 7. Check Permissions
-        perm_has = TextInserter.is_accessibility_granted()
+        perm_has = TextInserter.is_accessibility_granted() and self.hotkey_listener._tap is not None
         perm_label = (
-            "Универсальный доступ: Разрешено"
+            "Универсальный доступ: Активен ✅"
             if perm_has
-            else "Разрешить Универсальный доступ (Вставка)"
+            else "Проверить Универсальный доступ ⚠️"
         )
         perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             perm_label, "onCheckPermissions:", ""
@@ -538,7 +544,25 @@ class MenuAppController(NSObject):
             self.hud.showRecording()
             self.update_menu_status()
         else:
-            logger.warning("recorder.start() returned False")
+            logger.warning("recorder.start() returned False (Microphone access or device issue)")
+            self.sounds.play_cancel()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Ошибка доступа к микрофону")
+            alert.setInformativeText_(
+                "GigaDictate не удалось запустить запись аудио.\n\n"
+                "Проверьте, включен ли тумблер в:\n"
+                "Системные настройки → Конфиденциальность и безопасность → Микрофон."
+            )
+            alert.addButtonWithTitle_("Открыть Настройки микрофона")
+            alert.addButtonWithTitle_("Отмена")
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                try:
+                    url = NSURL.URLWithString_(
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                    )
+                    NSWorkspace.sharedWorkspace().openURL_(url)
+                except Exception as e:
+                    logger.debug(f"Open URL error: {e}")
 
     def stop_and_transcribe(self):
         logger.info("stop_and_transcribe executing on main thread")
@@ -848,6 +872,20 @@ class MenuAppController(NSObject):
         self.config.launch_at_login = new_val
         self.config.save()
         self.rebuild_menu()
+
+    def onFixAccessibility_(self, sender):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Активация горячей клавиши")
+        alert.setInformativeText_(
+            "macOS требует активный 'Универсальный доступ' для работы глобальной клавиши.\n\n"
+            "Если тумблер для GigaDictate уже включен в настройках:\n"
+            "1. Выключите тумблер GigaDictate и включите его обратно (или удалите кнопкой '-' и добавьте снова).\n"
+            "2. Перехват клавиши подключится автоматически без перезапуска приложения."
+        )
+        alert.addButtonWithTitle_("Открыть Настройки macOS")
+        alert.addButtonWithTitle_("Позже")
+        if alert.runModal() == NSAlertFirstButtonReturn:
+            TextInserter.request_accessibility()
 
     def onCheckPermissions_(self, sender):
         if not TextInserter.is_accessibility_granted():
