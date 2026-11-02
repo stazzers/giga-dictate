@@ -195,7 +195,22 @@ class MenuAppController(NSObject):
                     self._perm_check_timer = None
                 self.rebuild_menu()
 
+    def _on_model_progress(self, downloaded, total):
+        pct = int(downloaded / total * 100) if total > 0 else 0
+        mb_down = downloaded / (1024 * 1024)
+        mb_total = total / (1024 * 1024)
+        AppHelper.callAfter(
+            self.update_status_title, f"{pct}% ({int(mb_down)}/{int(mb_total)}M)"
+        )
+
     def _initial_model_load(self):
+        try:
+            import gigaam
+            if hasattr(gigaam, "set_download_progress_callback"):
+                gigaam.set_download_progress_callback(self._on_model_progress)
+        except Exception as e:
+            logger.debug(f"Progress callback setup error: {e}")
+
         success = self.engine.load()
         if success:
             AppHelper.callAfter(self.onModelLoaded_, None)
