@@ -1,9 +1,8 @@
 import logging
-import os
-import threading
 import time
-from typing import Optional
-from AppKit import NSPasteboard, NSStringPboardType, NSURL, NSWorkspace
+from concurrent.futures import ThreadPoolExecutor
+
+from AppKit import NSURL, NSPasteboard, NSStringPboardType, NSWorkspace
 from ApplicationServices import (
     AXIsProcessTrusted,
     AXIsProcessTrustedWithOptions,
@@ -18,6 +17,10 @@ from Quartz import (
 )
 
 logger = logging.getLogger("giga_dictate.inserter")
+
+_RESTORE_POOL = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="ClipboardRestorer"
+)
 
 
 # Privacy types recognized by macOS clipboard history tools and iCloud Universal Clipboard
@@ -52,11 +55,11 @@ class TextInserter:
 
         # Open System Settings directly to Accessibility panel via native Cocoa NSWorkspace
         try:
-            url = NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            url = NSURL.URLWithString_(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            )
             if url:
                 NSWorkspace.sharedWorkspace().openURL_(url)
-        except Exception as e:
-            logger.error(f"Failed to open System Settings: {e}")
         except Exception as e:
             logger.error(f"Failed to open System Settings: {e}")
 
@@ -78,7 +81,7 @@ class TextInserter:
         if add_trailing_space and not text.endswith(" "):
             text += " "
 
-        old_clipboard: Optional[str] = None
+        old_clipboard: str | None = None
         if restore_clipboard:
             try:
                 old_clipboard = self._pasteboard.stringForType_(NSStringPboardType)
@@ -124,17 +127,20 @@ class TextInserter:
             logger.error(f"Failed to post CGEvent: {e}")
             return False
 
-        # 4. Optional restore clipboard after application consumed it
-        if restore_clipboard and old_clipboard is not None:
+        # 4. Secure clipboard wipe/restore: erase dictated text from pasteboard immediately after paste
+        if restore_clipboard:
 
             def _restore():
-                time.sleep(0.5)
+                time.sleep(0.35)
                 try:
                     self._pasteboard.clearContents()
-                    self._pasteboard.setString_forType_(old_clipboard, NSStringPboardType)
+                    if old_clipboard:
+                        self._pasteboard.setString_forType_(
+                            old_clipboard, NSStringPboardType
+                        )
                 except Exception as e:
                     logger.debug(f"Failed to restore clipboard: {e}")
 
-            threading.Thread(target=_restore, daemon=True).start()
+            _RESTORE_POOL.submit(_restore)
 
         return True

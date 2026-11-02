@@ -1,12 +1,16 @@
 import logging
 import threading
-from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import sounddevice as sd
 
 logger = logging.getLogger("giga_dictate.audio")
 
 SAMPLE_RATE = 16000
+_AUDIO_CLEANUP_POOL = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="AudioCleanup"
+)
 
 
 def split_audio_into_chunks(
@@ -14,7 +18,7 @@ def split_audio_into_chunks(
     sr: int = SAMPLE_RATE,
     max_sec: float = 20.0,
     min_split_sec: float = 12.0,
-) -> List[np.ndarray]:
+) -> list[np.ndarray]:
     """
     Splits long audio into chunks shorter than max_sec (GigaAM limit is 25s),
     finding the quietest point (silence) between min_split_sec and max_sec.
@@ -39,12 +43,14 @@ def split_audio_into_chunks(
         search_end = start + max_len
         search_audio = audio[search_start:search_end]
 
-        # Calculate energy in 100ms frames
+        # Calculate energy in 100ms frames without extra array allocations
         frame_size = int(0.1 * sr)
         num_frames = len(search_audio) // frame_size
         if num_frames > 0:
-            frames = search_audio[: num_frames * frame_size].reshape(num_frames, frame_size)
-            energies = np.sum(frames**2, axis=1)
+            frames = search_audio[: num_frames * frame_size].reshape(
+                num_frames, frame_size
+            )
+            energies = np.einsum("ij,ij->i", frames, frames)
             min_idx = int(np.argmin(energies))
             split_offset = search_start + (min_idx * frame_size) + (frame_size // 2)
         else:
@@ -64,11 +70,11 @@ class AudioRecorder:
     Thread-safe and deadlock-free using synchronized stream transitions and stream.abort().
     """
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, device: Optional[int] = None):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, device: int | None = None):
         self.sample_rate = sample_rate
         self.device = device
-        self._stream: Optional[sd.InputStream] = None
-        self._frames: List[np.ndarray] = []
+        self._stream: sd.InputStream | None = None
+        self._frames: list[np.ndarray] = []
         self._recording = False
         self._current_level = 0.0
         self._speech_speed = 1.0
@@ -88,7 +94,7 @@ class AudioRecorder:
         """Returns speech cadence/tempo multiplier in range [1.0, 3.0]."""
         return self._speech_speed if self._recording else 1.0
 
-    def get_audio_state(self) -> Tuple[float, float]:
+    def get_audio_state(self) -> tuple[float, float]:
         """Returns (amplitude_level, speech_speed) in a single atomic call."""
         if not self._recording:
             return 0.0, 1.0
@@ -106,7 +112,13 @@ class AudioRecorder:
                 self._frames.append(indata.copy())
 
         try:
-            rms = float(np.sqrt(np.mean(indata**2)))
+            flat = indata.ravel()
+            n_samples = len(flat)
+            if n_samples == 0:
+                return
+
+            # Vectorized RMS via BLAS scalar product (zero intermediate array allocations)
+            rms = float(np.sqrt(np.dot(flat, flat) / n_samples))
             if rms < 0.002:
                 target = 0.0
                 instant_speed = 1.0
@@ -115,7 +127,14 @@ class AudioRecorder:
                 # Syllable delta and articulation / timbre proxy
                 delta_e = abs(rms - self._prev_rms)
                 self._prev_rms = rms
-                zcr = float(np.mean(indata[:-1] * indata[1:] < 0)) if len(indata) > 1 else 0.0
+
+                # Fast zero-crossing rate via signbit transitions (no temporary array multiplications)
+                signs = np.signbit(flat)
+                zcr = (
+                    float(np.count_nonzero(signs[:-1] != signs[1:]) / (n_samples - 1))
+                    if n_samples > 1
+                    else 0.0
+                )
 
                 # Dynamic speed multiplier (1.0x for slow, up to 3.0x for fast dictation)
                 instant_speed = 1.0 + min(2.2, delta_e * 55.0 + zcr * 10.0)
@@ -182,7 +201,7 @@ class AudioRecorder:
         finally:
             self._stream_mutex.release()
 
-    def stop(self) -> Tuple[np.ndarray, float]:
+    def stop(self) -> tuple[np.ndarray, float]:
         """
         Stops recording and immediately schedules microphone release.
         Returns audio frames instantly without waiting for hardware teardown.
@@ -195,7 +214,10 @@ class AudioRecorder:
             frames = self._frames
             self._frames = []
 
-        audio = np.concatenate(frames, axis=0).flatten() if frames else np.array([], dtype=np.float32)
+        if frames:
+            audio = np.concatenate(frames, axis=0).ravel()
+        else:
+            audio = np.array([], dtype=np.float32)
         duration = len(audio) / self.sample_rate
 
         def _async_close():
@@ -206,10 +228,10 @@ class AudioRecorder:
                 finally:
                     self._stream_mutex.release()
 
-        threading.Thread(target=_async_close, daemon=True).start()
+        _AUDIO_CLEANUP_POOL.submit(_async_close)
         return audio, duration
 
-    def set_device(self, device: Optional[int]):
+    def set_device(self, device: int | None):
         """Sets the preferred audio device (takes effect on next recording)."""
         self.device = device
 

@@ -1,9 +1,8 @@
 import logging
 import os
-import sys
-import threading
 import time
-from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
+
 import objc
 from AppKit import (
     NSAlert,
@@ -22,7 +21,7 @@ from AppKit import (
     NSTextField,
     NSVariableStatusItemLength,
 )
-from Foundation import NSObject
+from Foundation import NSObject, NSTimer
 from PyObjCTools import AppHelper
 
 from .audio import AudioRecorder
@@ -34,6 +33,8 @@ from .inserter import TextInserter
 from .sounds import SoundManager
 
 logger = logging.getLogger("giga_dictate.menu_app")
+
+_WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaWorker")
 
 MODELS = [
     ("v3_e2e_ctc", "v3 E2E CTC (Рекомендуется, быстрый, пунктуация)"),
@@ -79,6 +80,8 @@ class MenuAppController(NSObject):
         self.menu = None
         self.menu_icon = None
         self.menu_icon_rec = None
+        self._status_menu_item = None
+        self._toggle_menu_item = None
 
         # Voice Input HUD
         self.hud = VoiceInputHUD.alloc().init()
@@ -137,16 +140,20 @@ class MenuAppController(NSObject):
             )
 
         # Ensure pure menu bar accessory policy (no Dock icon, managed exclusively from menu bar)
-        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
 
-        # Load GigaAM model on background thread
-        threading.Thread(target=self._initial_model_load, daemon=True).start()
+        # Load GigaAM model on background worker
+        _WORKER_EXECUTOR.submit(self._initial_model_load)
 
     def onCheckPermissionsTick_(self, timer):
         """Periodically checks if user granted Accessibility and connects event tap automatically."""
         if TextInserter.is_accessibility_granted():
             if self.hotkey_listener._tap is None:
-                logger.info("Accessibility granted by user! Activating hotkey listener...")
+                logger.info(
+                    "Accessibility granted by user! Activating hotkey listener..."
+                )
                 self.hotkey_listener.start()
             if self.hotkey_listener._tap is not None:
                 if self._perm_check_timer is not None:
@@ -162,7 +169,9 @@ class MenuAppController(NSObject):
         if success:
             AppHelper.callAfter(self.onModelLoaded_, None)
         else:
-            AppHelper.callAfter(self.onModelError_, self.engine.load_error or "Unknown error")
+            AppHelper.callAfter(
+                self.onModelError_, self.engine.load_error or "Unknown error"
+            )
 
     def onModelLoaded_(self, _):
         self.update_status_title("")
@@ -205,7 +214,11 @@ class MenuAppController(NSObject):
         elif not self.engine.is_loaded:
             status_text = "⏳ Загрузка модели GigaAM-v3..."
         else:
-            mode_desc = "Удерживайте" if self.config.hotkey_mode == "push_to_talk" else "Нажмите"
+            mode_desc = (
+                "Удерживайте"
+                if self.config.hotkey_mode == "push_to_talk"
+                else "Нажмите"
+            )
             status_text = f"🟢 Готов к вводу ({mode_desc} {self.config.hotkey})"
 
         status_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -213,15 +226,19 @@ class MenuAppController(NSObject):
         )
         status_item.setEnabled_(False)
         menu.addItem_(status_item)
+        self._status_menu_item = status_item
 
         # 2. Manual toggle recording
-        action_title = "⏹️ Остановить запись" if self.recorder.is_recording else "🎙️ Начать запись"
+        action_title = (
+            "⏹️ Остановить запись" if self.recorder.is_recording else "🎙️ Начать запись"
+        )
         toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             action_title, "onMenuToggleRecord:", ""
         )
         toggle_item.setTarget_(self)
         toggle_item.setEnabled_(self.engine.is_loaded)
         menu.addItem_(toggle_item)
+        self._toggle_menu_item = toggle_item
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -327,7 +344,11 @@ class MenuAppController(NSObject):
 
         # 8. Check Permissions
         perm_has = TextInserter.is_accessibility_granted()
-        perm_label = "🛡️ Универсальный доступ: Разрешено" if perm_has else "⚠️ Разрешить Универсальный доступ (Вставка)"
+        perm_label = (
+            "🛡️ Универсальный доступ: Разрешено"
+            if perm_has
+            else "⚠️ Разрешить Универсальный доступ (Вставка)"
+        )
         perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             perm_label, "onCheckPermissions:", ""
         )
@@ -353,6 +374,31 @@ class MenuAppController(NSObject):
         if self.status_item:
             self.status_item.setMenu_(menu)
 
+    def update_menu_status(self):
+        """Updates dynamic status and toggle items in-place without rebuilding entire menu."""
+        if self._status_menu_item is None or self._toggle_menu_item is None:
+            self.rebuild_menu()
+            return
+
+        if self.recorder.is_recording:
+            status_text = "🔴 Идет запись голоса..."
+            action_title = "⏹️ Остановить запись"
+        elif not self.engine.is_loaded:
+            status_text = "⏳ Загрузка модели GigaAM-v3..."
+            action_title = "🎙️ Начать запись"
+        else:
+            mode_desc = (
+                "Удерживайте"
+                if self.config.hotkey_mode == "push_to_talk"
+                else "Нажмите"
+            )
+            status_text = f"🟢 Готов к вводу ({mode_desc} {self.config.hotkey})"
+            action_title = "🎙️ Начать запись"
+
+        self._status_menu_item.setTitle_(status_text)
+        self._toggle_menu_item.setTitle_(action_title)
+        self._toggle_menu_item.setEnabled_(self.engine.is_loaded)
+
     # --- Actions ---
 
     def onMenuToggleRecord_(self, sender):
@@ -374,14 +420,16 @@ class MenuAppController(NSObject):
     def start_recording(self):
         logger.info("start_recording executing on main thread")
         if not self.engine.is_loaded:
-            logger.info("Model still warming up in background. Pre-roll recording started.")
+            logger.info(
+                "Model still warming up in background. Pre-roll recording started."
+            )
 
         if self.recorder.start():
             logger.info("Audio recording started! Showing HUD.")
             self.update_status_title("Запись...", recording=True)
             self.sounds.play_start()
             self.hud.showRecording()
-            self.rebuild_menu()
+            self.update_menu_status()
         else:
             logger.warning("recorder.start() returned False")
 
@@ -394,9 +442,9 @@ class MenuAppController(NSObject):
         self.update_status_title("Обработка...")
         self.sounds.play_stop()
         self.hud.showTranscribing()
-        self.rebuild_menu()
+        self.update_menu_status()
 
-        # Stop recording and run transcription in worker thread
+        # Stop recording and run transcription in dedicated worker executor
         audio, duration = self.recorder.stop()
 
         def _worker():
@@ -407,7 +455,9 @@ class MenuAppController(NSObject):
                 return
 
             if not self.engine.is_loaded:
-                logger.info("Waiting for model warmup to finish before transcription...")
+                logger.info(
+                    "Waiting for model warmup to finish before transcription..."
+                )
                 self.engine.wait_loaded(timeout=15.0)
 
             t0 = time.time()
@@ -419,13 +469,6 @@ class MenuAppController(NSObject):
                     f"Transcribed speech in {proc_time:.2f}s ({len(text)} chars, {word_count} words). "
                     "Zero-Persistence: text content is not written to disk logs."
                 )
-
-                try:
-                    import torch
-                    if torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
-                except (RuntimeError, AttributeError, ImportError) as err:
-                    logger.debug(f"MPS cache cleanup skipped: {err}")
 
                 if text:
                     # Insert text under cursor
@@ -446,12 +489,12 @@ class MenuAppController(NSObject):
                 self.sounds.play_cancel()
                 AppHelper.callAfter(self._finishTranscription_, "")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _WORKER_EXECUTOR.submit(_worker)
 
     def _finishTranscription_(self, text):
         self.hud.hideHUD()
         self.update_status_title("")
-        self.rebuild_menu()
+        self.update_menu_status()
 
     def onSelectModel_(self, sender):
         new_model = sender.representedObject()
@@ -466,7 +509,7 @@ class MenuAppController(NSObject):
             self.engine.load(model_name=new_model)
             AppHelper.callAfter(self.onModelLoaded_, None)
 
-        threading.Thread(target=_reload, daemon=True).start()
+        _WORKER_EXECUTOR.submit(_reload)
 
     def onSelectDevice_(self, sender):
         new_device = sender.representedObject()
@@ -481,7 +524,7 @@ class MenuAppController(NSObject):
             self.engine.load(device=new_device)
             AppHelper.callAfter(self.onModelLoaded_, None)
 
-        threading.Thread(target=_reload, daemon=True).start()
+        _WORKER_EXECUTOR.submit(_reload)
 
     def onSelectMode_(self, sender):
         new_mode = sender.representedObject()
@@ -506,7 +549,9 @@ class MenuAppController(NSObject):
         alert.addButtonWithTitle_("Сохранить")
         alert.addButtonWithTitle_("Отмена")
 
-        field = NSTextField.alloc().initWithFrame_(NSRect(NSPoint(0, 0), NSSize(260, 24)))
+        field = NSTextField.alloc().initWithFrame_(
+            NSRect(NSPoint(0, 0), NSSize(260, 24))
+        )
         field.setStringValue_(self.config.hotkey)
         alert.setAccessoryView_(field)
 
@@ -553,7 +598,9 @@ class MenuAppController(NSObject):
         else:
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Разрешения в порядке")
-            alert.setInformativeText_("Разрешение 'Универсальный доступ' уже предоставлено. Автовставка работает!")
+            alert.setInformativeText_(
+                "Разрешение 'Универсальный доступ' уже предоставлено. Автовставка работает!"
+            )
             alert.addButtonWithTitle_("OK")
             alert.runModal()
 
@@ -578,7 +625,9 @@ class MenuAppController(NSObject):
         self.hotkey_listener.stop()
         self.hud.hideHUD()
         self.recorder.close()
+        _WORKER_EXECUTOR.shutdown(wait=False)
         from AppKit import NSURL, NSWorkspace
+
         app_url = NSURL.fileURLWithPath_("/Applications/GigaDictate.app")
         if app_url:
             NSWorkspace.sharedWorkspace().openURL_(app_url)
@@ -588,4 +637,5 @@ class MenuAppController(NSObject):
         self.hotkey_listener.stop()
         self.hud.hideHUD()
         self.recorder.close()
+        _WORKER_EXECUTOR.shutdown(wait=False)
         NSApplication.sharedApplication().terminate_(self)

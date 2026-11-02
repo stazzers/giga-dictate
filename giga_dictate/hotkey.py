@@ -1,34 +1,35 @@
 import logging
 import time
-from typing import Callable, Optional
-from Quartz import (
-    CGEventTapCreate,
-    CGEventTapEnable,
-    kCGSessionEventTap,
-    kCGHeadInsertEventTap,
-    kCGEventTapOptionDefault,
-    kCGEventKeyDown,
-    kCGEventKeyUp,
-    kCGEventFlagsChanged,
-    kCGEventTapDisabledByTimeout,
-    kCGEventTapDisabledByUserInput,
-    CGEventGetIntegerValueField,
-    kCGKeyboardEventKeycode,
-    CGEventGetFlags,
-    kCGEventFlagMaskCommand,
-    kCGEventFlagMaskShift,
-    kCGEventFlagMaskAlternate,
-    kCGEventFlagMaskControl,
-)
+from collections.abc import Callable
+
 from CoreFoundation import (
     CFMachPortCreateRunLoopSource,
     CFRunLoopAddSource,
-    CFRunLoopRemoveSource,
     CFRunLoopGetMain,
-    kCFRunLoopCommonModes,
+    CFRunLoopRemoveSource,
     kCFAllocatorDefault,
+    kCFRunLoopCommonModes,
 )
 from PyObjCTools import AppHelper
+from Quartz import (
+    CGEventGetFlags,
+    CGEventGetIntegerValueField,
+    CGEventTapCreate,
+    CGEventTapEnable,
+    kCGEventFlagMaskAlternate,
+    kCGEventFlagMaskCommand,
+    kCGEventFlagMaskControl,
+    kCGEventFlagMaskShift,
+    kCGEventFlagsChanged,
+    kCGEventKeyDown,
+    kCGEventKeyUp,
+    kCGEventTapDisabledByTimeout,
+    kCGEventTapDisabledByUserInput,
+    kCGEventTapOptionDefault,
+    kCGHeadInsertEventTap,
+    kCGKeyboardEventKeycode,
+    kCGSessionEventTap,
+)
 
 logger = logging.getLogger("giga_dictate.hotkey")
 
@@ -75,13 +76,43 @@ MACOS_CHAR_TO_VK = {
     "ъ": 30,
     "ё": 50,
     # Numbers
-    "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22,
-    "7": 26, "8": 28, "9": 25, "0": 29,
+    "1": 18,
+    "2": 19,
+    "3": 20,
+    "4": 21,
+    "5": 23,
+    "6": 22,
+    "7": 26,
+    "8": 28,
+    "9": 25,
+    "0": 29,
     # Letters
-    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7,
-    "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15,
-    "y": 16, "t": 17, "o": 31, "u": 32, "i": 34, "p": 35, "l": 37,
-    "j": 38, "k": 40, "n": 45, "m": 46,
+    "a": 0,
+    "s": 1,
+    "d": 2,
+    "f": 3,
+    "h": 4,
+    "g": 5,
+    "z": 6,
+    "x": 7,
+    "c": 8,
+    "v": 9,
+    "b": 11,
+    "q": 12,
+    "w": 13,
+    "e": 14,
+    "r": 15,
+    "y": 16,
+    "t": 17,
+    "o": 31,
+    "u": 32,
+    "i": 34,
+    "p": 35,
+    "l": 37,
+    "j": 38,
+    "k": 40,
+    "n": 45,
+    "m": 46,
 }
 
 KEY_NAME_TO_VK = {
@@ -177,8 +208,8 @@ class HotkeyListener:
         self,
         hotkey_str: str = "right_cmd",
         mode: str = "toggle",
-        on_start: Optional[Callable[[], None]] = None,
-        on_stop: Optional[Callable[[], None]] = None,
+        on_start: Callable[[], None] | None = None,
+        on_stop: Callable[[], None] | None = None,
     ):
         self.hotkey_str = hotkey_str
         self.mode = mode
@@ -190,21 +221,25 @@ class HotkeyListener:
 
         self._tap = None
         self._run_loop_source = None
-        self._is_active = False       # Currently recording
-        self._is_key_down = False     # Physical key is held down
+        self._is_active = False  # Currently recording
+        self._is_key_down = False  # Physical key is held down
         self._last_toggle_time = 0.0
 
     def _update_target_vk(self, hotkey_str: str) -> None:
         try:
             self.target_vk = parse_hotkey(hotkey_str)
             self.hotkey_str = hotkey_str
-            logger.info(f"Target hotkey set: '{hotkey_str}' -> virtual keycode {self.target_vk}")
+            logger.info(
+                f"Target hotkey set: '{hotkey_str}' -> virtual keycode {self.target_vk}"
+            )
         except Exception as e:
-            logger.error(f"Invalid hotkey '{hotkey_str}': {e}, defaulting to Right Command (54)")
+            logger.error(
+                f"Invalid hotkey '{hotkey_str}': {e}, defaulting to Right Command (54)"
+            )
             self.target_vk = VK_RIGHT_COMMAND
             self.hotkey_str = "right_cmd"
 
-    def update_hotkey(self, hotkey_str: str, mode: Optional[str] = None) -> bool:
+    def update_hotkey(self, hotkey_str: str, mode: str | None = None) -> bool:
         """
         Updates hotkey and/or mode instantly without stopping the tap.
         """
@@ -226,6 +261,10 @@ class HotkeyListener:
             return event
 
         vk = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+        # Fast path: immediately bypass non-target keystrokes (99.99% of typing across macOS)
+        if vk != self.target_vk:
+            return event
+
         flags = CGEventGetFlags(event)
 
         is_down = False
@@ -258,11 +297,15 @@ class HotkeyListener:
                             self._last_toggle_time = now
                             self._is_active = not self._is_active
                             if self._is_active:
-                                logger.info(f"Native Tap Toggle: START recording (vk={vk})")
+                                logger.info(
+                                    f"Native Tap Toggle: START recording (vk={vk})"
+                                )
                                 if self.on_start:
                                     AppHelper.callAfter(self.on_start)
                             else:
-                                logger.info(f"Native Tap Toggle: STOP recording (vk={vk})")
+                                logger.info(
+                                    f"Native Tap Toggle: STOP recording (vk={vk})"
+                                )
                                 if self.on_stop:
                                     AppHelper.callAfter(self.on_stop)
                 elif is_up:
@@ -292,7 +335,9 @@ class HotkeyListener:
         self._is_active = False
         self._is_key_down = False
 
-        mask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged)
+        mask = (
+            (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged)
+        )
         try:
             self._tap = CGEventTapCreate(
                 kCGSessionEventTap,
@@ -308,8 +353,12 @@ class HotkeyListener:
                 )
                 return False
 
-            self._run_loop_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, self._tap, 0)
-            CFRunLoopAddSource(CFRunLoopGetMain(), self._run_loop_source, kCFRunLoopCommonModes)
+            self._run_loop_source = CFMachPortCreateRunLoopSource(
+                kCFAllocatorDefault, self._tap, 0
+            )
+            CFRunLoopAddSource(
+                CFRunLoopGetMain(), self._run_loop_source, kCFRunLoopCommonModes
+            )
             CGEventTapEnable(self._tap, True)
             logger.info(
                 f"Native Quartz event tap successfully registered for vk={self.target_vk} on CFRunLoopGetMain."
@@ -327,7 +376,9 @@ class HotkeyListener:
             try:
                 CGEventTapEnable(self._tap, False)
                 if self._run_loop_source is not None:
-                    CFRunLoopRemoveSource(CFRunLoopGetMain(), self._run_loop_source, kCFRunLoopCommonModes)
+                    CFRunLoopRemoveSource(
+                        CFRunLoopGetMain(), self._run_loop_source, kCFRunLoopCommonModes
+                    )
             except Exception:
                 pass
             self._tap = None

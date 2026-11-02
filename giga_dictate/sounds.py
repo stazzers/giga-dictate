@@ -1,6 +1,3 @@
-import os
-import threading
-from typing import Optional
 from AppKit import NSSound
 
 
@@ -20,14 +17,11 @@ class SoundManager:
         if not self.enabled:
             return
 
-        def _play():
-            sound = self._sounds.get(sound_name) or NSSound.soundNamed_(sound_name)
-            if sound is not None:
-                # Stop if currently playing and restart
-                sound.stop()
-                sound.play()
-
-        threading.Thread(target=_play, daemon=True).start()
+        sound = self._sounds.get(sound_name) or NSSound.soundNamed_(sound_name)
+        if sound is not None:
+            # NSSound.play() is natively asynchronous and non-blocking in Cocoa/CoreAudio
+            sound.stop()
+            sound.play()
 
     def play_start(self) -> None:
         """Recording started."""

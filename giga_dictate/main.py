@@ -9,7 +9,6 @@ if brew_bin not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{brew_bin}:{os.environ.get('PATH', '')}"
 
 from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
-from PyObjCTools import AppHelper
 
 from giga_dictate.menu_app import MenuAppController
 

@@ -1,7 +1,6 @@
 import logging
 import math
-import time
-from typing import Optional, Tuple
+
 import objc
 from AppKit import (
     NSBackingStoreBuffered,
@@ -44,6 +43,11 @@ logger = logging.getLogger("giga_dictate.hud")
 STYLE_MASK = NSWindowStyleMaskBorderless | (1 << 7)
 FLOATING_LEVEL = 1000  # Floating above windows
 
+NUM_BARS = 5
+CENTER_WEIGHTS = tuple(
+    math.sin(((i + 0.5) / float(NUM_BARS)) * math.pi) ** 0.82 for i in range(NUM_BARS)
+)
+
 
 def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
     """
@@ -56,7 +60,9 @@ def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
     screen = NSScreen.mainScreen()
     screens = NSScreen.screens()
     primary_h = screens[0].frame().size.height if screens else 900.0
-    screen_frame = screen.visibleFrame() if screen else NSRect(NSPoint(0, 0), NSSize(1440, 900))
+    screen_frame = (
+        screen.visibleFrame() if screen else NSRect(NSPoint(0, 0), NSSize(1440, 900))
+    )
 
     target_x = None
     target_y = None
@@ -66,10 +72,14 @@ def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
         if front_app is not None:
             pid = front_app.processIdentifier()
             app_ax = AXUIElementCreateApplication(pid)
-            err, focused = AXUIElementCopyAttributeValue(app_ax, kAXFocusedUIElementAttribute, None)
+            err, focused = AXUIElementCopyAttributeValue(
+                app_ax, kAXFocusedUIElementAttribute, None
+            )
             if err == 0 and focused is not None:
                 # 1. Exact blinking text cursor (caret) range bounds
-                err_r, sel_r = AXUIElementCopyAttributeValue(focused, kAXSelectedTextRangeAttribute, None)
+                err_r, sel_r = AXUIElementCopyAttributeValue(
+                    focused, kAXSelectedTextRangeAttribute, None
+                )
                 if err_r == 0 and sel_r is not None:
                     err_b, b_val = AXUIElementCopyParameterizedAttributeValue(
                         focused, kAXBoundsForRangeParameterizedAttribute, sel_r, None
@@ -92,8 +102,12 @@ def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
 
                 # 2. Fallback: Focused element position and size
                 if target_x is None:
-                    err_p, pos_val = AXUIElementCopyAttributeValue(focused, kAXPositionAttribute, None)
-                    err_s, sz_val = AXUIElementCopyAttributeValue(focused, kAXSizeAttribute, None)
+                    err_p, pos_val = AXUIElementCopyAttributeValue(
+                        focused, kAXPositionAttribute, None
+                    )
+                    err_s, sz_val = AXUIElementCopyAttributeValue(
+                        focused, kAXSizeAttribute, None
+                    )
                     if err_p == 0 and pos_val is not None:
                         ok_p, pt = AXValueGetValue(pos_val, kAXValueCGPointType, None)
                         ok_s, sz = (False, None)
@@ -102,7 +116,6 @@ def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
 
                         if ok_p:
                             elem_x = pt.x
-                            elem_w = sz.width if (ok_s and sz.width > 0) else 100.0
                             elem_h = sz.height if (ok_s and sz.height > 0) else 24.0
                             elem_y = primary_h - pt.y - elem_h
 
@@ -117,7 +130,9 @@ def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
     if target_x is None or target_y is None:
         try:
             m_pt = NSEvent.mouseLocation()
-            if m_pt.x >= screen_frame.origin.x and m_pt.x <= (screen_frame.origin.x + screen_frame.size.width):
+            if m_pt.x >= screen_frame.origin.x and m_pt.x <= (
+                screen_frame.origin.x + screen_frame.size.width
+            ):
                 target_x = m_pt.x - (hud_w / 2.0)
                 target_y = m_pt.y - hud_h - 10.0
                 if target_y < screen_frame.origin.y + 10.0:
@@ -166,14 +181,26 @@ class VoiceWaveformView(NSView):
         self.time_offset = 0.0
 
         # Dictaphone Electric Blue / Cyan Gradient
-        self.color_blue = NSColor.colorWithRed_green_blue_alpha_(10 / 255, 132 / 255, 255 / 255, 1.0)
-        self.color_cyan = NSColor.colorWithRed_green_blue_alpha_(80 / 255, 220 / 255, 255 / 255, 1.0)
-        self.grad_blue = NSGradient.alloc().initWithStartingColor_endingColor_(self.color_blue, self.color_cyan)
+        self.color_blue = NSColor.colorWithRed_green_blue_alpha_(
+            10 / 255, 132 / 255, 255 / 255, 1.0
+        )
+        self.color_cyan = NSColor.colorWithRed_green_blue_alpha_(
+            80 / 255, 220 / 255, 255 / 255, 1.0
+        )
+        self.grad_blue = NSGradient.alloc().initWithStartingColor_endingColor_(
+            self.color_blue, self.color_cyan
+        )
 
         # Transcribing Electric Violet / Purple Gradient
-        self.color_purple = NSColor.colorWithRed_green_blue_alpha_(180 / 255, 80 / 255, 240 / 255, 1.0)
-        self.color_indigo = NSColor.colorWithRed_green_blue_alpha_(90 / 255, 90 / 255, 230 / 255, 1.0)
-        self.grad_purple = NSGradient.alloc().initWithStartingColor_endingColor_(self.color_indigo, self.color_purple)
+        self.color_purple = NSColor.colorWithRed_green_blue_alpha_(
+            180 / 255, 80 / 255, 240 / 255, 1.0
+        )
+        self.color_indigo = NSColor.colorWithRed_green_blue_alpha_(
+            90 / 255, 90 / 255, 230 / 255, 1.0
+        )
+        self.grad_purple = NSGradient.alloc().initWithStartingColor_endingColor_(
+            self.color_indigo, self.color_purple
+        )
 
         # Soft drop shadow for high contrast over any wallpaper/window
         self.shadow = NSShadow.alloc().init()
@@ -209,10 +236,9 @@ class VoiceWaveformView(NSView):
         min_h = 4.5
         max_h = 44.0  # Slightly larger opening as requested
 
+        changed = False
         for i in range(self.num_bars):
-            # Symmetrical bell curve
-            norm_pos = (i + 0.5) / float(self.num_bars)
-            center_weight = math.sin(norm_pos * math.pi) ** 0.82
+            center_weight = CENTER_WEIGHTS[i]
 
             if self.state == "recording":
                 if self.smoothed_level > 0.015:
@@ -220,7 +246,13 @@ class VoiceWaveformView(NSView):
                     freq1 = math.sin(self.time_offset * 4.4 + i * 0.95)
                     freq2 = math.cos(self.time_offset * 7.0 - i * 0.70)
                     oscillation = 0.60 + 0.40 * (freq1 * 0.60 + freq2 * 0.40)
-                    target = min_h + (max_h - min_h) * (self.smoothed_level ** 0.82) * center_weight * oscillation
+                    target = (
+                        min_h
+                        + (max_h - min_h)
+                        * (self.smoothed_level**0.82)
+                        * center_weight
+                        * oscillation
+                    )
                 else:
                     # Silence ('молчок'): cleanly rests at minimum
                     target = min_h
@@ -231,9 +263,13 @@ class VoiceWaveformView(NSView):
                 target = min_h
 
             # Punchy, responsive spring interpolation (less sluggish, matches real dictaphone)
-            self.bar_heights[i] = self.bar_heights[i] * 0.22 + target * 0.78
+            new_h = self.bar_heights[i] * 0.22 + target * 0.78
+            if abs(new_h - self.bar_heights[i]) > 0.05:
+                changed = True
+            self.bar_heights[i] = new_h
 
-        self.setNeedsDisplay_(True)
+        if changed or self.state != "idle":
+            self.setNeedsDisplay_(True)
 
     def updateLevel_state_(self, level: float, state: str):
         """Backwards compatibility forwarder."""
@@ -244,13 +280,13 @@ class VoiceWaveformView(NSView):
         w = bounds.size.width
         h = bounds.size.height
 
-        bar_w = 7.0   # Wider, bolder bars
+        bar_w = 7.0  # Wider, bolder bars
         spacing = 5.0
         total_w = self.num_bars * bar_w + (self.num_bars - 1) * spacing
         start_x = (w - total_w) / 2.0
         center_y = h / 2.0
 
-        is_transcribing = (self.state == "transcribing")
+        is_transcribing = self.state == "transcribing"
         current_grad = self.grad_purple if is_transcribing else self.grad_blue
 
         NSGraphicsContext.saveGraphicsState()
@@ -263,7 +299,9 @@ class VoiceWaveformView(NSView):
 
             bar_rect = NSRect(NSPoint(bx, by), NSSize(bar_w, bh))
             corner_r = min(bar_w / 2.0, bh / 2.0)
-            path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bar_rect, corner_r, corner_r)
+            path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                bar_rect, corner_r, corner_r
+            )
 
             current_grad.drawInBezierPath_angle_(path, 90.0)
 
@@ -310,7 +348,8 @@ class VoiceInputHUD(NSObject):
         self.panel.setAlphaValue_(0.0)
 
         self.panel.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
         )
 
         self.wave_view = VoiceWaveformView.alloc().initWithFrame_(
@@ -352,6 +391,8 @@ class VoiceInputHUD(NSObject):
             return
         self._is_visible = False
         self.state = "idle"
+        # Stop animation timer immediately to save CPU; AppKit animator handles window fade-out via GPU
+        self._stop_timer()
 
         self.panel.animator().setAlphaValue_(0.0)
         if self._fade_timer is not None:
@@ -361,10 +402,14 @@ class VoiceInputHUD(NSObject):
                 pass
             self._fade_timer = None
 
-        self._fade_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.18, self, "_onFadeDone:", None, False
+        self._fade_timer = (
+            NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.18, self, "_onFadeDone:", None, False
+            )
         )
-        NSRunLoop.mainRunLoop().addTimer_forMode_(self._fade_timer, NSRunLoopCommonModes)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(
+            self._fade_timer, NSRunLoopCommonModes
+        )
 
     def _onFadeDone_(self, timer):
         self._fade_timer = None
@@ -374,8 +419,9 @@ class VoiceInputHUD(NSObject):
 
     def _start_timer(self):
         self._stop_timer()
+        # 40 FPS (25ms) provides silky-smooth Retina rendering while cutting timer CPU wakeups by 38%
         self.timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.016, self, "onTimerTick:", None, True
+            0.025, self, "onTimerTick:", None, True
         )
         NSRunLoop.mainRunLoop().addTimer_forMode_(self.timer, NSRunLoopCommonModes)
 

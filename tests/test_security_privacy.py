@@ -45,6 +45,23 @@ class TestSecurityAndPrivacy(unittest.TestCase):
         self.assertFalse(hasattr(recorder, "session"))
         recorder.close()
 
+    def test_clipboard_erasure_after_insert(self):
+        """Ensure that dictated text is erased/restored after insertion."""
+        import time
+        inserter = TextInserter()
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_("PREVIOUS_USER_COPY", NSStringPboardType)
+
+        # Insert new speech with restore_clipboard=True
+        inserter.insert_text("TEMPORARY_VOICE_TEXT", add_trailing_space=False, restore_clipboard=True)
+        time.sleep(0.5)
+
+        # Spoken text MUST NOT remain in clipboard!
+        current = pb.stringForType_(NSStringPboardType)
+        self.assertNotEqual(current, "TEMPORARY_VOICE_TEXT")
+        self.assertEqual(current, "PREVIOUS_USER_COPY")
+
 
 if __name__ == "__main__":
     unittest.main()
