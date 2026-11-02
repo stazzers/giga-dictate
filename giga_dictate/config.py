@@ -38,6 +38,7 @@ class AppConfig:
     min_duration: float = 0.25
     audio_device: int | None = None
     show_settings_on_launch: bool = False
+    custom_hotkey: str | None = None
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -45,9 +46,12 @@ class AppConfig:
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return cls(
+                config = cls(
                     **{k: v for k, v in data.items() if k in cls.__annotations__}
                 )
+                if config.custom_hotkey is None and config.hotkey != "right_cmd":
+                    config.custom_hotkey = config.hotkey
+                return config
             except Exception as e:
                 print(
                     f"[Config] Error loading config from {CONFIG_PATH}: {e}, using defaults."

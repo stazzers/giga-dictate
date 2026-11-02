@@ -116,7 +116,7 @@ MACOS_CHAR_TO_VK = {
 }
 
 KEY_NAME_TO_VK = {
-    # Command (SuperDictate default)
+    # Command (Right Command)
     "right_cmd": VK_RIGHT_COMMAND,
     "cmd_r": VK_RIGHT_COMMAND,
     "command_r": VK_RIGHT_COMMAND,
@@ -173,6 +173,8 @@ KEY_NAME_TO_VK = {
     "ввод": 36,
     "esc": 53,
     "escape": 53,
+    "delete": 51,
+    "backspace": 51,
     # Function keys
     "f1": 122,
     "f2": 120,
@@ -189,8 +191,107 @@ KEY_NAME_TO_VK = {
 }
 
 
+VK_TO_IDENTIFIER_AND_LABEL = {
+    VK_RIGHT_COMMAND: ("right_cmd", "Правый Command (Right Cmd)"),
+    VK_LEFT_COMMAND: ("left_cmd", "Левый Command (Left Cmd)"),
+    VK_RIGHT_SHIFT: ("right_shift", "Правый Shift (Right Shift)"),
+    VK_LEFT_SHIFT: ("left_shift", "Левый Shift (Left Shift)"),
+    VK_RIGHT_OPTION: ("alt_r", "Правый Option / Alt (Right Option)"),
+    VK_LEFT_OPTION: ("alt_l", "Левый Option / Alt (Left Option)"),
+    VK_RIGHT_CONTROL: ("ctrl_r", "Правый Control (Right Control)"),
+    VK_LEFT_CONTROL: ("ctrl_l", "Левый Control (Left Control)"),
+    49: ("space", "Пробел (Space)"),
+    36: ("enter", "Enter / Return"),
+    48: ("tab", "Tab"),
+    53: ("esc", "Escape (Esc)"),
+    51: ("delete", "Delete / Backspace"),
+    44: ("/", "Слэш ( / )"),
+    47: (".", "Точка ( . )"),
+    43: (",", "Запятая ( , )"),
+    41: (";", "Точка с запятой ( ; )"),
+    39: ("'", "Апостроф ( ' )"),
+    33: ("[", "Квадратная скобка ["),
+    30: ("]", "Квадратная скобка ]"),
+    27: ("-", "Минус ( - )"),
+    24: ("=", "Равно ( = )"),
+    50: ("`", "Тильда / Ё ( ` )"),
+    42: ("\\", "Обратный слэш ( \\ )"),
+    122: ("f1", "Клавиша F1"),
+    120: ("f2", "Клавиша F2"),
+    99: ("f3", "Клавиша F3"),
+    118: ("f4", "Клавиша F4"),
+    96: ("f5", "Клавиша F5"),
+    97: ("f6", "Клавиша F6"),
+    98: ("f7", "Клавиша F7"),
+    100: ("f8", "Клавиша F8"),
+    101: ("f9", "Клавиша F9"),
+    109: ("f10", "Клавиша F10"),
+    103: ("f11", "Клавиша F11"),
+    111: ("f12", "Клавиша F12"),
+    # Numbers
+    18: ("1", "Цифра 1"),
+    19: ("2", "Цифра 2"),
+    20: ("3", "Цифра 3"),
+    21: ("4", "Цифра 4"),
+    23: ("5", "Цифра 5"),
+    22: ("6", "Цифра 6"),
+    26: ("7", "Цифра 7"),
+    28: ("8", "Цифра 8"),
+    25: ("9", "Цифра 9"),
+    29: ("0", "Цифра 0"),
+    # Letters
+    0: ("a", "Клавиша A"),
+    1: ("s", "Клавиша S"),
+    2: ("d", "Клавиша D"),
+    3: ("f", "Клавиша F"),
+    4: ("h", "Клавиша H"),
+    5: ("g", "Клавиша G"),
+    6: ("z", "Клавиша Z"),
+    7: ("x", "Клавиша X"),
+    8: ("c", "Клавиша C"),
+    9: ("v", "Клавиша V"),
+    11: ("b", "Клавиша B"),
+    12: ("q", "Клавиша Q"),
+    13: ("w", "Клавиша W"),
+    14: ("e", "Клавиша E"),
+    15: ("r", "Клавиша R"),
+    16: ("y", "Клавиша Y"),
+    17: ("t", "Клавиша T"),
+    31: ("o", "Клавиша O"),
+    32: ("u", "Клавиша U"),
+    34: ("i", "Клавиша I"),
+    35: ("p", "Клавиша P"),
+    37: ("l", "Клавиша L"),
+    38: ("j", "Клавиша J"),
+    40: ("k", "Клавиша K"),
+    45: ("n", "Клавиша N"),
+    46: ("m", "Клавиша M"),
+}
+
+
+def vk_to_hotkey_identifier_and_label(vk: int) -> tuple[str, str]:
+    """Converts a virtual keycode to (config_identifier, human_readable_label)."""
+    if vk in VK_TO_IDENTIFIER_AND_LABEL:
+        return VK_TO_IDENTIFIER_AND_LABEL[vk]
+    return f"key_{vk}", f"Клавиша (код {vk})"
+
+
+def get_hotkey_display_name(hotkey_str: str | None) -> str:
+    """Returns a user-friendly Russian display label for any hotkey string."""
+    if not hotkey_str:
+        return "(не назначена)"
+    clean = hotkey_str.strip().lower()
+    try:
+        vk = parse_hotkey(clean)
+        return vk_to_hotkey_identifier_and_label(vk)[1]
+    except Exception:
+        return hotkey_str
+
+
 def parse_hotkey(hotkey_str: str) -> int:
     clean = hotkey_str.strip().lower()
+    if clean.startswith("key_") and clean[4:].isdigit():
+        return int(clean[4:])
     if clean in KEY_NAME_TO_VK:
         return KEY_NAME_TO_VK[clean]
     if clean in MACOS_CHAR_TO_VK:
@@ -201,7 +302,7 @@ def parse_hotkey(hotkey_str: str) -> int:
 class HotkeyListener:
     """
     100% Native macOS Quartz Event Tap listener attached directly to CFRunLoopGetMain
-    in kCFRunLoopCommonModes (identical architecture to SuperDictate / Parakey).
+    in kCFRunLoopCommonModes.
     """
 
     def __init__(

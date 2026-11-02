@@ -1,10 +1,8 @@
 import unittest
-from AppKit import (
-    NSApplication,
-    NSApplicationActivationPolicyAccessory,
-)
-from giga_dictate.menu_app import MenuAppController, MODELS, DEVICES, HOTKEY_PRESETS
-from giga_dictate.config import AppConfig
+
+from AppKit import NSApplication
+
+from giga_dictate.menu_app import MenuAppController
 
 
 class TestMenuAppUI(unittest.TestCase):
@@ -38,12 +36,61 @@ class TestMenuAppUI(unittest.TestCase):
         self.assertTrue(any("Звуковые сигналы" in t for t in titles))
         self.assertTrue(any("Добавлять пробел" in t for t in titles))
         self.assertTrue(any("Универсальный доступ" in t for t in titles))
+        self.assertTrue(any("полное удаление" in t.lower() for t in titles))
         self.assertTrue(any("Завершить" in t for t in titles))
+        self.assertTrue(hasattr(controller, "onUninstallAppDialog_"))
+        self.assertTrue(hasattr(controller, "execute_complete_uninstallation"))
+
+    def test_hotkey_three_line_submenu(self):
+        controller = MenuAppController.alloc().init()
+        # 1. Default state: only 2 items (default + change key), NO middle custom key row
+        controller.config.hotkey = "right_cmd"
+        controller.config.custom_hotkey = None
+        controller.rebuild_menu()
+
+        menu = controller.menu
+        hotkey_item = next(item for item in menu.itemArray() if "Горячая клавиша" in (item.title() or ""))
+        submenu = hotkey_item.submenu()
+        self.assertIsNotNone(submenu)
+
+        sub_titles = [item.title() for item in submenu.itemArray() if item.title()]
+        self.assertEqual(len(sub_titles), 2)
+        self.assertTrue("По умолчанию" in sub_titles[0])
+        self.assertTrue("Правый Command" in sub_titles[0])
+        self.assertTrue("Изменить клавишу" in sub_titles[1])
+        # Default key is checked
+        items = [item for item in submenu.itemArray() if item.title()]
+        self.assertEqual(items[0].state(), 1)
+
+        # 2. Custom hotkey selected (differs from default): middle row appears
+        controller.config.hotkey = "f8"
+        controller.config.custom_hotkey = "f8"
+        controller.rebuild_menu()
+
+        items_custom = next(item for item in controller.menu.itemArray() if "Горячая клавиша" in (item.title() or "")).submenu().itemArray()
+        sub_custom = [item for item in items_custom if item.title()]
+        self.assertEqual(len(sub_custom), 3)
+        self.assertTrue("По умолчанию" in sub_custom[0].title())
+        self.assertEqual(sub_custom[0].state(), 0)  # unselected but clickable
+        self.assertTrue("Выбранная клавиша" in sub_custom[1].title())
+        self.assertTrue("F8" in sub_custom[1].title())
+        self.assertEqual(sub_custom[1].state(), 1)  # selected
+        self.assertTrue("Изменить клавишу" in sub_custom[2].title())
+
+        # 3. Switching back to default: middle row disappears immediately!
+        controller.onSelectDefaultHotkey_(None)
+        self.assertEqual(controller.config.hotkey, "right_cmd")
+        items_def = next(item for item in controller.menu.itemArray() if "Горячая клавиша" in (item.title() or "")).submenu().itemArray()
+        sub_def = [item for item in items_def if item.title()]
+        self.assertEqual(len(sub_def), 2)  # middle row is gone!
+        self.assertTrue("По умолчанию" in sub_def[0].title())
+        self.assertEqual(sub_def[0].state(), 1)
+        self.assertTrue("Изменить клавишу" in sub_def[1].title())
 
     def test_recording_menubar_clean_icon_only(self):
         controller = MenuAppController.alloc().init()
         # Mock status item button
-        from AppKit import NSButton, NSStatusBar, NSVariableStatusItemLength, NSImage
+        from AppKit import NSImage, NSStatusBar, NSVariableStatusItemLength
         sb = NSStatusBar.systemStatusBar()
         controller.status_item = sb.statusItemWithLength_(NSVariableStatusItemLength)
         controller.menu_icon = NSImage.alloc().init()

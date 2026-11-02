@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -9,6 +10,14 @@ from AppKit import (
     NSAlertFirstButtonReturn,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSBackingStoreBuffered,
+    NSButton,
+    NSColor,
+    NSEvent,
+    NSEventMaskFlagsChanged,
+    NSEventMaskKeyDown,
+    NSFloatingWindowLevel,
+    NSFont,
     NSImage,
     NSImageLeft,
     NSImageOnly,
@@ -16,18 +25,28 @@ from AppKit import (
     NSMenuItem,
     NSPoint,
     NSRect,
+    NSRoundedBezelStyle,
     NSSize,
     NSStatusBar,
+    NSTextAlignmentCenter,
     NSTextField,
     NSVariableStatusItemLength,
+    NSWindow,
+    NSWindowStyleMaskClosable,
+    NSWindowStyleMaskTitled,
 )
-from Foundation import NSObject, NSTimer
+from Foundation import NSBundle, NSObject, NSTimer
 from PyObjCTools import AppHelper
 
 from .audio import AudioRecorder
 from .config import AppConfig
 from .engine import GigaAMEngine
-from .hotkey import HotkeyListener, parse_hotkey
+from .hotkey import (
+    MODIFIER_MASKS,
+    HotkeyListener,
+    get_hotkey_display_name,
+    vk_to_hotkey_identifier_and_label,
+)
 from .hud import VoiceInputHUD
 from .inserter import TextInserter
 from .sounds import SoundManager
@@ -48,14 +67,18 @@ DEVICES = [
     ("cpu", "CPU (Процессор)"),
 ]
 
-HOTKEY_PRESETS = [
-    ("right_cmd", "Правый Command (Right Cmd) — как в SuperDictate"),
-    ("right_shift", "Правый Shift (Right Shift)"),
-    ("alt_r", "Правый Option / Alt (Right Option)"),
-    ("ctrl_r", "Правый Control (Right Control)"),
-    ("f8", "Клавиша F8"),
-    ("/", "Слэш ( / )"),
-]
+
+class CaptureWindowDelegate(NSObject):
+    def initWithController_(self, controller):
+        self = objc.super(CaptureWindowDelegate, self).init()
+        if self is None:
+            return None
+        self._controller = controller
+        return self
+
+    def windowWillClose_(self, notification):
+        if self._controller:
+            self._controller._clean_capture_monitors()
 
 
 _GLOBAL_STATUS_ITEMS = []
@@ -95,6 +118,13 @@ class MenuAppController(NSObject):
             on_start=self.on_hotkey_start,
             on_stop=self.on_hotkey_stop,
         )
+
+        # Key capture window state
+        self._capture_window = None
+        self._capture_local_monitor = None
+        self._capture_global_monitor = None
+        self._is_capturing_key = False
+        self._capture_delegate = None
 
         return self
 
@@ -219,7 +249,9 @@ class MenuAppController(NSObject):
                 if self.config.hotkey_mode == "push_to_talk"
                 else "Нажмите"
             )
-            status_text = f"🟢 Готов к вводу ({mode_desc} {self.config.hotkey})"
+            status_text = (
+                f"🟢 Готов к вводу ({mode_desc} {get_hotkey_display_name(self.config.hotkey)})"
+            )
 
         status_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             status_text, None, ""
@@ -302,26 +334,42 @@ class MenuAppController(NSObject):
         menu.addItem_(mode_menu_item)
 
         # 6. Hotkey Selection Submenu
+        curr_label = get_hotkey_display_name(self.config.hotkey)
         hotkey_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f"Горячая клавиша: {self.config.hotkey}", None, ""
+            f"Горячая клавиша: {curr_label}", None, ""
         )
         hotkey_sub = NSMenu.alloc().init()
-        for h_id, h_label in HOTKEY_PRESETS:
-            h_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                h_label, "onSelectHotkeyPreset:", ""
+
+        is_default = self.config.hotkey == "right_cmd"
+
+        # 1. Default hotkey: Right Command
+        def_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "По умолчанию: Правый Command (Right Cmd)", "onSelectDefaultHotkey:", ""
+        )
+        def_item.setTarget_(self)
+        if is_default:
+            def_item.setState_(1)
+        hotkey_sub.addItem_(def_item)
+
+        # 2. Selected custom hotkey (added in the middle ONLY if differs from default)
+        if not is_default:
+            cust_label = f"Выбранная клавиша: {get_hotkey_display_name(self.config.hotkey)}"
+            cust_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                cust_label, "onSelectCustomHotkey:", ""
             )
-            h_item.setTarget_(self)
-            h_item.setRepresentedObject_(h_id)
-            if self.config.hotkey == h_id:
-                h_item.setState_(1)
-            hotkey_sub.addItem_(h_item)
+            cust_item.setTarget_(self)
+            cust_item.setState_(1)
+            hotkey_sub.addItem_(cust_item)
 
         hotkey_sub.addItem_(NSMenuItem.separatorItem())
-        custom_h_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "✏️ Назначить другую клавишу...", "onCustomHotkeyDialog:", ""
+
+        # 3. Configure / change hotkey
+        record_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "✏️ Изменить клавишу...", "onCustomHotkeyDialog:", ""
         )
-        custom_h_item.setTarget_(self)
-        hotkey_sub.addItem_(custom_h_item)
+        record_item.setTarget_(self)
+        hotkey_sub.addItem_(record_item)
+
         hotkey_menu_item.setSubmenu_(hotkey_sub)
         menu.addItem_(hotkey_menu_item)
 
@@ -357,12 +405,20 @@ class MenuAppController(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        # 9. About & Quit
+        # 9. About, Uninstall & Quit
         about_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "О программе GigaDictate...", "onAboutDialog:", ""
         )
         about_item.setTarget_(self)
         menu.addItem_(about_item)
+
+        uninstall_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "🗑️ Полное удаление...", "onUninstallAppDialog:", ""
+        )
+        uninstall_item.setTarget_(self)
+        menu.addItem_(uninstall_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
 
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Завершить GigaDictate", "onQuitApp:", "q"
@@ -392,7 +448,9 @@ class MenuAppController(NSObject):
                 if self.config.hotkey_mode == "push_to_talk"
                 else "Нажмите"
             )
-            status_text = f"🟢 Готов к вводу ({mode_desc} {self.config.hotkey})"
+            status_text = (
+                f"🟢 Готов к вводу ({mode_desc} {get_hotkey_display_name(self.config.hotkey)})"
+            )
             action_title = "🎙️ Начать запись"
 
         self._status_menu_item.setTitle_(status_text)
@@ -533,42 +591,195 @@ class MenuAppController(NSObject):
         self.hotkey_listener.update_hotkey(self.config.hotkey, mode=new_mode)
         self.rebuild_menu()
 
-    def onSelectHotkeyPreset_(self, sender):
-        new_hotkey = sender.representedObject()
-        self.config.hotkey = new_hotkey
+    def onSelectDefaultHotkey_(self, sender):
+        if self.config.hotkey == "right_cmd":
+            return
+        self.config.hotkey = "right_cmd"
+        self.config.custom_hotkey = None
         self.config.save()
-        self.hotkey_listener.update_hotkey(new_hotkey)
+        self.hotkey_listener.update_hotkey("right_cmd")
+        self.rebuild_menu()
+
+    def onSelectCustomHotkey_(self, sender):
+        if not self.config.custom_hotkey:
+            self.onCustomHotkeyDialog_(sender)
+            return
+        if self.config.hotkey == self.config.custom_hotkey:
+            return
+        self.config.hotkey = self.config.custom_hotkey
+        self.config.save()
+        self.hotkey_listener.update_hotkey(self.config.custom_hotkey)
         self.rebuild_menu()
 
     def onCustomHotkeyDialog_(self, sender):
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Назначить горячую клавишу")
-        alert.setInformativeText_(
-            "Введите клавишу или комбинацию (например: right_shift, alt_r, f8, f5, ctrl+space, cmd+shift+d):"
-        )
-        alert.addButtonWithTitle_("Сохранить")
-        alert.addButtonWithTitle_("Отмена")
+        """Opens automatic key recorder window where pressing any key captures it."""
+        self._open_key_capture_window()
 
-        field = NSTextField.alloc().initWithFrame_(
-            NSRect(NSPoint(0, 0), NSSize(260, 24))
-        )
-        field.setStringValue_(self.config.hotkey)
-        alert.setAccessoryView_(field)
+    def _open_key_capture_window(self):
+        # If already open, bring to front
+        if self._capture_window is not None:
+            self._capture_window.makeKeyAndOrderFront_(None)
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            return
 
-        resp = alert.runModal()
-        if resp == NSAlertFirstButtonReturn:
-            val = str(field.stringValue()).strip()
-            try:
-                parse_hotkey(val)
-                self.config.hotkey = val
+        rect = NSRect(NSPoint(0, 0), NSSize(380, 205))
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setTitle_("Назначение горячей клавиши")
+        window.center()
+        window.setLevel_(NSFloatingWindowLevel)
+        window.setReleasedWhenClosed_(False)
+
+        self._capture_delegate = CaptureWindowDelegate.alloc().initWithController_(self)
+        window.setDelegate_(self._capture_delegate)
+
+        content = window.contentView()
+
+        # Title
+        title_label = NSTextField.alloc().initWithFrame_(
+            NSRect(NSPoint(20, 150), NSSize(340, 26))
+        )
+        title_label.setStringValue_("🎙️ Назначение клавиши записи")
+        title_label.setFont_(NSFont.boldSystemFontOfSize_(15.0))
+        title_label.setAlignment_(NSTextAlignmentCenter)
+        title_label.setBezeled_(False)
+        title_label.setDrawsBackground_(False)
+        title_label.setEditable_(False)
+        title_label.setSelectable_(False)
+        content.addSubview_(title_label)
+
+        # Key badge / placeholder
+        badge = NSTextField.alloc().initWithFrame_(
+            NSRect(NSPoint(40, 92), NSSize(300, 46))
+        )
+        badge.setStringValue_("[ Нажмите любую клавишу ]")
+        badge.setFont_(NSFont.boldSystemFontOfSize_(16.0))
+        badge.setAlignment_(NSTextAlignmentCenter)
+        badge.setBezeled_(True)
+        badge.setDrawsBackground_(True)
+        badge.setEditable_(False)
+        badge.setSelectable_(False)
+        content.addSubview_(badge)
+
+        # Hint text
+        hint = NSTextField.alloc().initWithFrame_(
+            NSRect(NSPoint(20, 48), NSSize(340, 34))
+        )
+        hint.setStringValue_(
+            "Нажмите клавишу на клавиатуре — система сразу зафиксирует её.\n(Для отмены нажмите кнопку ниже или Escape)"
+        )
+        hint.setFont_(NSFont.systemFontOfSize_(11.0))
+        hint.setTextColor_(NSColor.secondaryLabelColor())
+        hint.setAlignment_(NSTextAlignmentCenter)
+        hint.setBezeled_(False)
+        hint.setDrawsBackground_(False)
+        hint.setEditable_(False)
+        hint.setSelectable_(False)
+        content.addSubview_(hint)
+
+        # Cancel button
+        cancel_btn = NSButton.alloc().initWithFrame_(
+            NSRect(NSPoint(140, 14), NSSize(100, 28))
+        )
+        cancel_btn.setTitle_("Отмена")
+        cancel_btn.setTarget_(self)
+        cancel_btn.setAction_("onCancelHotkeyCapture:")
+        cancel_btn.setBezelStyle_(NSRoundedBezelStyle)
+        content.addSubview_(cancel_btn)
+
+        self._capture_window = window
+        self._is_capturing_key = True
+
+        def _on_key_event(event):
+            if not getattr(self, "_is_capturing_key", False):
+                return event
+
+            evt_type = event.type()
+            vk = event.keyCode()
+
+            is_down = False
+            if evt_type == 10:  # KeyDown
+                is_down = True
+            elif evt_type == 12:  # FlagsChanged
+                if vk in MODIFIER_MASKS:
+                    mask = MODIFIER_MASKS[vk]
+                    is_down = bool(event.modifierFlags() & mask)
+                else:
+                    is_down = True
+
+            if not is_down:
+                return event
+
+            # Escape cancels capture
+            if vk == 53:  # Escape
+                AppHelper.callAfter(self._close_key_capture_window)
+                return None
+
+            self._is_capturing_key = False
+            code_str, label = vk_to_hotkey_identifier_and_label(vk)
+            logger.info(f"Captured hotkey: vk={vk} -> {code_str} ({label})")
+
+            def finish_capture():
+                if code_str == "right_cmd":
+                    self.config.hotkey = "right_cmd"
+                    self.config.custom_hotkey = None
+                else:
+                    self.config.custom_hotkey = code_str
+                    self.config.hotkey = code_str
                 self.config.save()
-                self.hotkey_listener.update_hotkey(val)
+                self.hotkey_listener.update_hotkey(code_str)
+                self._close_key_capture_window()
                 self.rebuild_menu()
-            except Exception as e:
-                err_alert = NSAlert.alloc().init()
-                err_alert.setMessageText_("Некорректная клавиша")
-                err_alert.setInformativeText_(str(e))
-                err_alert.runModal()
+
+            AppHelper.callAfter(finish_capture)
+            return None
+
+        event_mask = NSEventMaskKeyDown | NSEventMaskFlagsChanged
+        self._capture_local_monitor = (
+            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                event_mask, _on_key_event
+            )
+        )
+        self._capture_global_monitor = (
+            NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                event_mask, _on_key_event
+            )
+        )
+
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        window.makeKeyAndOrderFront_(None)
+
+    def _clean_capture_monitors(self):
+        self._is_capturing_key = False
+        if getattr(self, "_capture_local_monitor", None) is not None:
+            try:
+                NSEvent.removeMonitor_(self._capture_local_monitor)
+            except Exception:
+                pass
+            self._capture_local_monitor = None
+        if getattr(self, "_capture_global_monitor", None) is not None:
+            try:
+                NSEvent.removeMonitor_(self._capture_global_monitor)
+            except Exception:
+                pass
+            self._capture_global_monitor = None
+
+    def _close_key_capture_window(self):
+        self._clean_capture_monitors()
+        win = getattr(self, "_capture_window", None)
+        if win is not None:
+            self._capture_window = None
+            try:
+                win.close()
+            except Exception:
+                pass
+
+    def onCancelHotkeyCapture_(self, sender):
+        self._close_key_capture_window()
 
     def onToggleSound_(self, sender):
         self.config.sound_feedback = not self.config.sound_feedback
@@ -616,6 +827,93 @@ class MenuAppController(NSObject):
         )
         alert.addButtonWithTitle_("OK")
         alert.runModal()
+
+    def onUninstallAppDialog_(self, sender):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Вы действительно хотите полностью удалить GigaDictate?")
+        alert.setInformativeText_(
+            "Будет удалено приложение, сохраненная конфигурация, кэш моделей нейросети (~900 МБ) "
+            "и сброшены системные разрешения (микрофон, управление вводом)."
+        )
+        alert.setAlertStyle_(2)  # NSAlertStyleCritical
+        alert.addButtonWithTitle_("Да")
+        alert.addButtonWithTitle_("Нет")
+
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        response = alert.runModal()
+
+        # Если пользователь выбрал "Нет" (вторая кнопка) или закрыл диалог
+        if response != NSAlertFirstButtonReturn:
+            logger.info("Uninstallation cancelled by user.")
+            return
+
+        self.execute_complete_uninstallation()
+
+    def execute_complete_uninstallation(self):
+        logger.info("Executing complete uninstallation...")
+
+        # 1. Stop background components
+        try:
+            self.hotkey_listener.stop()
+            self.hud.hideHUD()
+            self.recorder.close()
+            _WORKER_EXECUTOR.shutdown(wait=False)
+        except Exception as e:
+            logger.warning(f"Error stopping components during uninstall: {e}")
+
+        # 2. Determine running bundle path
+        bundle = NSBundle.mainBundle()
+        bundle_path = bundle.bundlePath() if bundle else ""
+        pid = os.getpid()
+
+        # 3. Spawn detached uninstallation script
+        cleanup_script = f"""
+sleep 0.5
+while kill -0 {pid} 2>/dev/null; do sleep 0.1; done
+
+# Remove running app bundle if applicable
+if [ -n "{bundle_path}" ] && [ -d "{bundle_path}" ] && [[ "{bundle_path}" == *".app"* ]]; then
+    rm -rf "{bundle_path}" 2>/dev/null || true
+fi
+rm -rf "/Applications/GigaDictate.app" 2>/dev/null || true
+rm -rf "$HOME/Applications/GigaDictate.app" 2>/dev/null || true
+
+# Unregister from LaunchServices
+LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREG" ]; then
+    "$LSREG" -u "/Applications/GigaDictate.app" 2>/dev/null || true
+    if [ -n "{bundle_path}" ]; then
+        "$LSREG" -u "{bundle_path}" 2>/dev/null || true
+    fi
+    "$LSREG" -gc 2>/dev/null || true
+fi
+
+# Reset macOS TCC Permissions
+BUNDLE_ID="com.salute.gigadictate"
+tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset ListenEvent "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset SpeechRecognition "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset All "$BUNDLE_ID" 2>/dev/null || true
+
+# Purge config, logs and ~900MB neural network cache
+rm -rf "$HOME/.config/giga_dictate"
+rm -rf "$HOME/.cache/gigaam"
+rm -f "$HOME/Library/Logs/DiagnosticReports/GigaDictate"* 2>/dev/null || true
+rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null || true
+"""
+
+        try:
+            subprocess.Popen(
+                ["/bin/bash", "-c", cleanup_script],
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to spawn uninstall script: {e}")
+
+        # 4. Terminate process immediately
+        NSApplication.sharedApplication().terminate_(self)
 
     def onRestartApp_(self, sender):
         self.restart_application()
