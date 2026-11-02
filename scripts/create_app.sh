@@ -38,6 +38,7 @@ if [ -d "$PYTHON_FW" ]; then
     cp -R "$PYTHON_FW" "$FRAMEWORKS_DIR/Python.framework"
     # Prune unneeded development headers and test suites to optimize size
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Headers"
+    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/Headers"
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/include"
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/share"
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/test"
@@ -46,6 +47,7 @@ if [ -d "$PYTHON_FW" ]; then
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/tkinter"
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/Resources/Python.app"
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/_CodeSignature"
+    rm -f "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/site-packages"
 
     # Establish standard macOS framework symlinks for codesign compliance
     (
@@ -53,7 +55,7 @@ if [ -d "$PYTHON_FW" ]; then
         cd "$FRAMEWORKS_DIR/Python.framework" && ln -sf Versions/Current/Python Python
         cd "$FRAMEWORKS_DIR/Python.framework" && ln -sf Versions/Current/Resources Resources
     )
-    codesign -s - --force "$FRAMEWORKS_DIR/Python.framework/Versions/Current/Python"
+    codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
 fi
 
 # 4. Bundle Virtualenv site-packages into Resources/venv
@@ -135,9 +137,12 @@ install_name_tool -change \
 
 chmod +x "$MACOS_DIR/GigaDictate"
 
-# 7. Ad-hoc codesign application bundle with entitlements
-echo "Codesigning application bundle..."
-codesign -s - --force --deep --entitlements "$DIR/entitlements.plist" -r='designated => identifier "com.salute.gigadictate"' "$APP_DIR"
+# 7. Inside-out codesign: frameworks first, launcher binary, then application bundle
+echo "Codesigning application bundle (inside-out)..."
+codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
+codesign -s - --force "$MACOS_DIR/GigaDictate"
+codesign -s - --force --entitlements "$DIR/entitlements.plist" "$APP_DIR"
+codesign -vvv --deep --strict "$APP_DIR"
 
 echo "================================================="
 echo " Standalone bundle built successfully: $APP_DIR"
