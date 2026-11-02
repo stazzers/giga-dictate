@@ -90,10 +90,9 @@ if [ -d "$DIR/.venv" ]; then
     echo "Bundling dependencies from .venv into Resources/venv..."
     mkdir -p "$RESOURCES_DIR/venv/lib/python3.11"
     cp -R "$DIR/.venv/lib/python3.11/site-packages" "$RESOURCES_DIR/venv/lib/python3.11/"
-    # Prune developer packages and test fixtures to optimize disk footprint
+    # Prune developer headers and unused protoc binary to optimize footprint
     rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/include"
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/testing"
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/bin"
+    rm -f "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/bin/protoc"*
     rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/pip"*
     rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/PyObjCTest"*
     rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/setuptools"*
@@ -166,7 +165,7 @@ chmod +x "$MACOS_DIR/GigaDictate"
 
 # 7. Inside-out codesign: sign all Mach-O binaries (.so and .dylib), frameworks, launcher binary, then application bundle
 echo "Codesigning all bundled dynamic libraries and extensions..."
-find "$APP_DIR" -type f \( -name "*.so" -o -name "*.dylib" \) -exec codesign -s - --force {} +
+find "$APP_DIR" -type f \( -name "*.so" -o -name "*.dylib" -o -name "torch_shm_manager" \) -exec codesign -s - --force {} +
 codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
 codesign -s - --force "$MACOS_DIR/GigaDictate"
 codesign -s - --force --entitlements "$DIR/entitlements.plist" "$APP_DIR"
