@@ -111,7 +111,7 @@ class AudioDucker:
         # Fallback to osascript
         try:
             res = subprocess.check_output(
-                ["osascript", "-e", "output volume of (get volume settings)"],
+                ["/usr/bin/osascript", "-e", "output volume of (get volume settings)"],
                 stderr=subprocess.DEVNULL,
                 timeout=1.0,
             ).decode().strip()
@@ -149,7 +149,7 @@ class AudioDucker:
         try:
             pct = round(val_clamped * 100.0)
             subprocess.run(
-                ["osascript", "-e", f"set volume output volume {pct}"],
+                ["/usr/bin/osascript", "-e", f"set volume output volume {pct}"],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
