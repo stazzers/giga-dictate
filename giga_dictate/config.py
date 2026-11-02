@@ -100,6 +100,8 @@ class AppConfig:
     launch_at_login: bool = False
     live_hud_preview: bool = True  # Real-time streaming transcription preview in floating HUD
     hud_glass_style: str = "glass"  # "glass" (vibrant translucent), "balanced" (frosted), "matte" (high-contrast opaque)
+    audio_ducking: bool = True  # Automatically lower system volume during recording to prevent speaker bleed
+    ducking_volume: float = 0.12  # Target volume level during ducking (0.0 to 1.0)
 
     @property
     def hud_glass_alpha(self) -> float:

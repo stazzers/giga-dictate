@@ -43,6 +43,7 @@ from PyObjCTools import AppHelper
 
 from .audio import AudioRecorder
 from .config import AppConfig, is_launch_at_login_enabled, set_launch_at_login
+from .ducking import AudioDucker
 from .engine import GigaAMEngine
 from .hotkey import (
     MODIFIER_MASKS,
@@ -122,6 +123,7 @@ class MenuAppController(NSObject):
             device=self.config.device,
         )
         self.inserter = TextInserter()
+        self.ducker = AudioDucker()
 
         self.status_item = None
         self.menu = None
@@ -489,6 +491,13 @@ class MenuAppController(NSObject):
         sound_item.setState_(1 if self.config.sound_feedback else 0)
         menu.addItem_(sound_item)
 
+        ducking_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Приглушать звук Mac при записи", "onToggleAudioDucking:", ""
+        )
+        ducking_item.setTarget_(self)
+        ducking_item.setState_(1 if getattr(self.config, "audio_ducking", True) else 0)
+        menu.addItem_(ducking_item)
+
         space_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Добавлять пробел после текста", "onToggleSpace:", ""
         )
@@ -597,6 +606,8 @@ class MenuAppController(NSObject):
 
         if self.recorder.start():
             self._preview_session_id += 1
+            if getattr(self.config, "audio_ducking", True):
+                self.ducker.duck(target_volume=getattr(self.config, "ducking_volume", 0.12))
             if hasattr(self.engine, "reset_preview_cache"):
                 self.engine.reset_preview_cache()
             logger.info("Audio recording started! Showing HUD.")
@@ -608,6 +619,7 @@ class MenuAppController(NSObject):
                 self._start_preview_timer()
         else:
             logger.warning("recorder.start() returned False (Microphone access or device issue)")
+            self.ducker.unduck()
             self._stop_preview_timer()
             self.sounds.play_cancel()
             alert = NSAlert.alloc().init()
@@ -632,6 +644,7 @@ class MenuAppController(NSObject):
         logger.info("stop_and_transcribe executing on main thread")
         self._preview_session_id += 1
         self._stop_preview_timer()
+        self.ducker.unduck()
         if hasattr(self.engine, "reset_preview_cache"):
             self.engine.reset_preview_cache()
         if not self.recorder.is_recording:
@@ -759,6 +772,7 @@ class MenuAppController(NSObject):
 
     def _finishTranscription_(self, text):
         self._stop_preview_timer()
+        self.ducker.unduck()
         self.hud.hideHUD()
         self.update_status_title("")
         self.update_menu_status()
@@ -1017,6 +1031,13 @@ class MenuAppController(NSObject):
         self.config.save()
         self.rebuild_menu()
 
+    def onToggleAudioDucking_(self, sender):
+        self.config.audio_ducking = not getattr(self.config, "audio_ducking", True)
+        self.config.save()
+        if not self.config.audio_ducking and self.ducker.is_ducked:
+            self.ducker.unduck()
+        self.rebuild_menu()
+
     def onToggleSpace_(self, sender):
         self.config.add_trailing_space = not self.config.add_trailing_space
         self.config.save()
@@ -1106,6 +1127,7 @@ class MenuAppController(NSObject):
 
         # 1. Stop background components
         try:
+            self.ducker.unduck()
             self._stop_preview_timer()
             self.hotkey_listener.stop()
             self.hud.hideHUD()
@@ -1176,6 +1198,7 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
 
     def restart_application(self):
         logger.info("Restarting application...")
+        self.ducker.unduck()
         self._stop_preview_timer()
         self.hotkey_listener.stop()
         self.hud.hideHUD()
@@ -1190,6 +1213,7 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
         NSApplication.sharedApplication().terminate_(self)
 
     def onQuitApp_(self, sender):
+        self.ducker.unduck()
         self._stop_preview_timer()
         self.hotkey_listener.stop()
         self.hud.hideHUD()
