@@ -11,3 +11,4 @@ launcher
 *.log
 *.dmg
 build/
+.agents/

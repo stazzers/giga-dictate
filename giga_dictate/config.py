@@ -98,6 +98,17 @@ class AppConfig:
     show_settings_on_launch: bool = False
     custom_hotkey: str | None = None
     launch_at_login: bool = False
+    live_hud_preview: bool = True  # Real-time streaming transcription preview in floating HUD
+    hud_glass_style: str = "glass"  # "glass" (vibrant translucent), "balanced" (frosted), "matte" (high-contrast opaque)
+
+    @property
+    def hud_glass_alpha(self) -> float:
+        alphas = {
+            "glass": 0.25,
+            "balanced": 0.55,
+            "matte": 0.85,
+        }
+        return alphas.get(self.hud_glass_style, 0.25)
 
     @classmethod
     def load(cls) -> "AppConfig":

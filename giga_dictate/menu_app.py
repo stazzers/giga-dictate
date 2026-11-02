@@ -38,7 +38,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWorkspace,
 )
-from Foundation import NSBundle, NSObject, NSTimer
+from Foundation import NSBundle, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 from PyObjCTools import AppHelper
 
 from .audio import AudioRecorder
@@ -57,6 +57,7 @@ from .sounds import SoundManager
 logger = logging.getLogger("giga_dictate.menu_app")
 
 _WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaWorker")
+_PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaPreview")
 
 MODELS = [
     ("v3_e2e_ctc", "v3 E2E CTC (Рекомендуется, быстрый, пунктуация)"),
@@ -112,7 +113,14 @@ class MenuAppController(NSObject):
         # Voice Input HUD
         self.hud = VoiceInputHUD.alloc().init()
         self.hud.setAudioRecorder_(self.recorder)
+        if hasattr(self.hud, "setLivePreviewEnabled_"):
+            self.hud.setLivePreviewEnabled_(self.config.live_hud_preview)
+        if hasattr(self.hud, "setGlassStyle_"):
+            self.hud.setGlassStyle_(self.config.hud_glass_style)
         self._perm_check_timer = None
+        self._preview_timer = None
+        self._is_preview_running = False
+        self._preview_session_id = 0
 
         # Hotkey listener
         self.hotkey_listener = HotkeyListener(
@@ -424,6 +432,36 @@ class MenuAppController(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
 
         # 6. Preferences Checkboxes
+        preview_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Живой предпросмотр в HUD", "onToggleLiveHudPreview:", ""
+        )
+        preview_item.setTarget_(self)
+        preview_item.setState_(1 if self.config.live_hud_preview else 0)
+        menu.addItem_(preview_item)
+
+        # 6.1 HUD Glass Transparency Submenu
+        glass_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Стиль стекла HUD", None, ""
+        )
+        glass_sub = NSMenu.alloc().init()
+        glass_options = [
+            ("glass", "Стеклянный (Высокая прозрачность)"),
+            ("balanced", "Сбалансированный (Матовое стекло)"),
+            ("matte", "Матовый (Плотный контраст)"),
+        ]
+        for style_key, title in glass_options:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, "onSelectGlassStyle:", ""
+            )
+            item.setTarget_(self)
+            item.setRepresentedObject_(style_key)
+            item.setState_(1 if self.config.hud_glass_style == style_key else 0)
+            glass_sub.addItem_(item)
+
+        glass_menu_item.setSubmenu_(glass_sub)
+        glass_menu_item.setEnabled_(self.config.live_hud_preview)
+        menu.addItem_(glass_menu_item)
+
         sound_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Звуковые сигналы", "onToggleSound:", ""
         )
@@ -538,13 +576,17 @@ class MenuAppController(NSObject):
             )
 
         if self.recorder.start():
+            self._preview_session_id += 1
             logger.info("Audio recording started! Showing HUD.")
             self.update_status_title("Запись...", recording=True)
             self.sounds.play_start()
             self.hud.showRecording()
             self.update_menu_status()
+            if self.config.live_hud_preview:
+                self._start_preview_timer()
         else:
             logger.warning("recorder.start() returned False (Microphone access or device issue)")
+            self._stop_preview_timer()
             self.sounds.play_cancel()
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Ошибка доступа к микрофону")
@@ -566,6 +608,8 @@ class MenuAppController(NSObject):
 
     def stop_and_transcribe(self):
         logger.info("stop_and_transcribe executing on main thread")
+        self._preview_session_id += 1
+        self._stop_preview_timer()
         if not self.recorder.is_recording:
             logger.warning("stop_and_transcribe called, but recorder is not recording.")
             return
@@ -622,7 +666,74 @@ class MenuAppController(NSObject):
 
         _WORKER_EXECUTOR.submit(_worker)
 
+    def _start_preview_timer(self):
+        self._stop_preview_timer()
+        self._is_preview_running = False
+        # Tick every 0.35s (~2.8 times per second) for real-time live preview
+        self._preview_timer = (
+            NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.35, self, "onPreviewTimerTick:", None, True
+            )
+        )
+        NSRunLoop.mainRunLoop().addTimer_forMode_(
+            self._preview_timer, NSRunLoopCommonModes
+        )
+
+    def _stop_preview_timer(self):
+        if getattr(self, "_preview_timer", None) is not None:
+            try:
+                self._preview_timer.invalidate()
+            except Exception as e:
+                logger.debug(f"Preview timer invalidation error: {e}")
+            self._preview_timer = None
+        self._is_preview_running = False
+
+    def onPreviewTimerTick_(self, timer):
+        if not self.recorder.is_recording or not self.config.live_hud_preview:
+            return
+        if not self.engine.is_loaded or getattr(self, "_is_preview_running", False):
+            return
+
+        snapshot = self.recorder.get_stream_snapshot(max_seconds=None)
+        if len(snapshot) < int(0.4 * self.recorder.sample_rate):
+            return
+
+        self._is_preview_running = True
+        session_id = self._preview_session_id
+
+        def _preview_worker():
+            try:
+                if not self.recorder.is_recording or session_id != getattr(self, "_preview_session_id", 0):
+                    return
+                text = self.engine.transcribe_preview(snapshot)
+                if (
+                    text
+                    and self.recorder.is_recording
+                    and session_id == getattr(self, "_preview_session_id", 0)
+                ):
+                    AppHelper.callAfter(self._deliver_preview_text, text, session_id)
+            except Exception as e:
+                logger.debug(f"Live preview worker error: {e}")
+            finally:
+                if session_id == getattr(self, "_preview_session_id", 0):
+                    self._is_preview_running = False
+
+        try:
+            _PREVIEW_EXECUTOR.submit(_preview_worker)
+        except Exception as e:
+            logger.debug(f"Failed to submit preview worker: {e}")
+            self._is_preview_running = False
+
+    def _deliver_preview_text(self, text: str, session_id: int):
+        if (
+            session_id == getattr(self, "_preview_session_id", 0)
+            and self.recorder.is_recording
+            and getattr(self.hud, "state", None) == "recording"
+        ):
+            self.hud.setPreviewText_(text)
+
     def _finishTranscription_(self, text):
+        self._stop_preview_timer()
         self.hud.hideHUD()
         self.update_status_title("")
         self.update_menu_status()
@@ -854,6 +965,27 @@ class MenuAppController(NSObject):
     def onCancelHotkeyCapture_(self, sender):
         self._close_key_capture_window()
 
+    def onToggleLiveHudPreview_(self, sender):
+        self.config.live_hud_preview = not self.config.live_hud_preview
+        self.config.save()
+        if hasattr(self.hud, "setLivePreviewEnabled_"):
+            self.hud.setLivePreviewEnabled_(self.config.live_hud_preview)
+        if self.recorder.is_recording:
+            if self.config.live_hud_preview:
+                self._start_preview_timer()
+            else:
+                self._stop_preview_timer()
+        self.rebuild_menu()
+
+    def onSelectGlassStyle_(self, sender):
+        style_key = sender.representedObject()
+        if style_key and style_key in ("glass", "balanced", "matte"):
+            self.config.hud_glass_style = str(style_key)
+            self.config.save()
+            if hasattr(self.hud, "setGlassStyle_"):
+                self.hud.setGlassStyle_(self.config.hud_glass_style)
+            self.rebuild_menu()
+
     def onToggleSound_(self, sender):
         self.config.sound_feedback = not self.config.sound_feedback
         self.sounds.enabled = self.config.sound_feedback
@@ -949,10 +1081,12 @@ class MenuAppController(NSObject):
 
         # 1. Stop background components
         try:
+            self._stop_preview_timer()
             self.hotkey_listener.stop()
             self.hud.hideHUD()
             self.recorder.close()
-            _WORKER_EXECUTOR.shutdown(wait=False)
+            _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
             logger.warning(f"Error stopping components during uninstall: {e}")
 
@@ -1017,10 +1151,12 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
 
     def restart_application(self):
         logger.info("Restarting application...")
+        self._stop_preview_timer()
         self.hotkey_listener.stop()
         self.hud.hideHUD()
         self.recorder.close()
-        _WORKER_EXECUTOR.shutdown(wait=False)
+        _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         from AppKit import NSURL, NSWorkspace
 
         app_url = NSURL.fileURLWithPath_("/Applications/GigaDictate.app")
@@ -1029,8 +1165,10 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
         NSApplication.sharedApplication().terminate_(self)
 
     def onQuitApp_(self, sender):
+        self._stop_preview_timer()
         self.hotkey_listener.stop()
         self.hud.hideHUD()
         self.recorder.close()
-        _WORKER_EXECUTOR.shutdown(wait=False)
+        _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         NSApplication.sharedApplication().terminate_(self)

@@ -100,6 +100,45 @@ class AudioRecorder:
             return 0.0, 1.0
         return self._current_level, self._speech_speed
 
+    def get_stream_snapshot(self, max_seconds: float | None = None) -> np.ndarray:
+        """
+        Thread-safe snapshot of recorded audio for live preview streaming.
+        If max_seconds is None, returns all accumulated audio of the current recording session
+        so full phrases can be transcribed. If max_seconds is a positive number, returns the tail slice.
+        If max_seconds <= 0, returns an empty array.
+        Does not interrupt active recording or cause audio buffer dropouts.
+        """
+        if max_seconds is not None and max_seconds <= 0:
+            return np.array([], dtype=np.float32)
+
+        with self._lock:
+            if not self._recording or not self._frames:
+                return np.array([], dtype=np.float32)
+
+            if max_seconds is not None:
+                max_samples = int(max_seconds * self.sample_rate)
+                if max_samples <= 0:
+                    return np.array([], dtype=np.float32)
+                total = 0
+                needed_frames = []
+                for frame in reversed(self._frames):
+                    needed_frames.append(frame)
+                    total += len(frame)
+                    if total >= max_samples:
+                        break
+                frames_copy = list(reversed(needed_frames))
+            else:
+                max_samples = None
+                frames_copy = list(self._frames)
+
+        if not frames_copy:
+            return np.array([], dtype=np.float32)
+
+        audio = np.concatenate(frames_copy, axis=0).ravel()
+        if max_samples is not None and len(audio) > max_samples:
+            audio = audio[-max_samples:]
+        return audio.astype(np.float32, copy=False)
+
     def _callback(self, indata, frames, time_info, status):
         if status:
             logger.warning(f"Audio stream status: {status}")
