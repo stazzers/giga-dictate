@@ -55,6 +55,7 @@ int main(int argc, char *argv[]) {
     // 4. Configure environment
     setenv("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
     setenv("PYTHONUNBUFFERED", "1", 1);
+    setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
 
     if (is_bundled) {
         setenv("PYTHONHOME", bundled_py_home, 1);

@@ -164,9 +164,9 @@ install_name_tool -change \
 
 chmod +x "$MACOS_DIR/GigaDictate"
 
-# 7. Inside-out codesign: frameworks and dylibs first, launcher binary, then application bundle
-echo "Codesigning application bundle (inside-out)..."
-codesign -s - --force "$FRAMEWORKS_DIR"/*.dylib
+# 7. Inside-out codesign: sign all Mach-O binaries (.so and .dylib), frameworks, launcher binary, then application bundle
+echo "Codesigning all bundled dynamic libraries and extensions..."
+find "$APP_DIR" -type f \( -name "*.so" -o -name "*.dylib" \) -exec codesign -s - --force {} +
 codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
 codesign -s - --force "$MACOS_DIR/GigaDictate"
 codesign -s - --force --entitlements "$DIR/entitlements.plist" "$APP_DIR"
