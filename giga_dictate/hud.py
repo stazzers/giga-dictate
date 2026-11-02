@@ -137,8 +137,8 @@ def locate_caret_or_cursor(hud_w: float = 72.0, hud_h: float = 52.0) -> NSPoint:
                 target_y = m_pt.y - hud_h - 10.0
                 if target_y < screen_frame.origin.y + 10.0:
                     target_y = m_pt.y + 10.0
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cursor position fallback error: {e}")
 
     # 4. Ultimate fallback: Bottom-center of the screen
     if target_x is None or target_y is None:
@@ -365,8 +365,8 @@ class VoiceInputHUD(NSObject):
         if self._fade_timer is not None:
             try:
                 self._fade_timer.invalidate()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Fade timer invalidation error: {e}")
             self._fade_timer = None
 
         self.state = "recording"
@@ -398,8 +398,8 @@ class VoiceInputHUD(NSObject):
         if self._fade_timer is not None:
             try:
                 self._fade_timer.invalidate()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Fade timer invalidation error: {e}")
             self._fade_timer = None
 
         self._fade_timer = (
@@ -429,8 +429,8 @@ class VoiceInputHUD(NSObject):
         if self.timer is not None:
             try:
                 self.timer.invalidate()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"HUD timer invalidation error: {e}")
             self.timer = None
 
     def onTimerTick_(self, timer):

@@ -480,8 +480,8 @@ class HotkeyListener:
                     CFRunLoopRemoveSource(
                         CFRunLoopGetMain(), self._run_loop_source, kCFRunLoopCommonModes
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Event tap removal error ignored: {e}")
             self._tap = None
             self._run_loop_source = None
 

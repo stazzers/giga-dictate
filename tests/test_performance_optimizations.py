@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import numpy as np
 from AppKit import NSPasteboard, NSStringPboardType
 
@@ -106,8 +107,12 @@ class TestPerformanceOptimizations(unittest.TestCase):
         pb.setString_forType_("BASELINE_CLIPBOARD", NSStringPboardType)
 
         threads_before = threading.active_count()
-        inserter.insert_text("OPTIMIZED_SPEECH", add_trailing_space=False, restore_clipboard=True)
-        time.sleep(0.55)
+        with (
+            patch.object(TextInserter, "is_accessibility_granted", return_value=True),
+            patch("giga_dictate.inserter.CGEventPost"),
+        ):
+            inserter.insert_text("OPTIMIZED_SPEECH", add_trailing_space=False, restore_clipboard=True)
+            time.sleep(0.55)
 
         current = pb.stringForType_(NSStringPboardType)
         self.assertEqual(current, "BASELINE_CLIPBOARD")

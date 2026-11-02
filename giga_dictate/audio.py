@@ -147,8 +147,8 @@ class AudioRecorder:
 
             # Smooth speed transition (faster cadence tracking)
             self._speech_speed = self._speech_speed * 0.60 + instant_speed * 0.40
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Audio volume computation error ignored: {e}")
 
     def _cleanup_unlocked(self):
         """Stops and closes the stream immediately without buffer-draining deadlocks."""
@@ -156,11 +156,12 @@ class AudioRecorder:
             try:
                 self._stream.abort()
                 self._stream.close()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Stream abort error ignored: {e}")
                 try:
                     self._stream.close()
-                except Exception:
-                    pass
+                except Exception as ex:
+                    logger.debug(f"Stream close fallback error ignored: {ex}")
             finally:
                 self._stream = None
 

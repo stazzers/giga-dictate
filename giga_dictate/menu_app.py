@@ -1,5 +1,6 @@
 import logging
 import os
+import shlex
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -758,14 +759,14 @@ class MenuAppController(NSObject):
         if getattr(self, "_capture_local_monitor", None) is not None:
             try:
                 NSEvent.removeMonitor_(self._capture_local_monitor)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Local monitor removal error: {e}")
             self._capture_local_monitor = None
         if getattr(self, "_capture_global_monitor", None) is not None:
             try:
                 NSEvent.removeMonitor_(self._capture_global_monitor)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Global monitor removal error: {e}")
             self._capture_global_monitor = None
 
     def _close_key_capture_window(self):
@@ -775,8 +776,8 @@ class MenuAppController(NSObject):
             self._capture_window = None
             try:
                 win.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Capture window close error: {e}")
 
     def onCancelHotkeyCapture_(self, sender):
         self._close_key_capture_window()
@@ -864,16 +865,17 @@ class MenuAppController(NSObject):
         # 2. Determine running bundle path
         bundle = NSBundle.mainBundle()
         bundle_path = bundle.bundlePath() if bundle else ""
-        pid = os.getpid()
+        safe_bundle = shlex.quote(str(bundle_path))
+        pid = int(os.getpid())
 
-        # 3. Spawn detached uninstallation script
+        # 3. Spawn detached uninstallation script safely
         cleanup_script = f"""
 sleep 0.5
 while kill -0 {pid} 2>/dev/null; do sleep 0.1; done
 
 # Remove running app bundle if applicable
-if [ -n "{bundle_path}" ] && [ -d "{bundle_path}" ] && [[ "{bundle_path}" == *".app"* ]]; then
-    rm -rf "{bundle_path}" 2>/dev/null || true
+if [ -n {safe_bundle} ] && [ -d {safe_bundle} ] && [[ {safe_bundle} == *".app"* ]]; then
+    rm -rf {safe_bundle} 2>/dev/null || true
 fi
 rm -rf "/Applications/GigaDictate.app" 2>/dev/null || true
 rm -rf "$HOME/Applications/GigaDictate.app" 2>/dev/null || true
@@ -882,8 +884,8 @@ rm -rf "$HOME/Applications/GigaDictate.app" 2>/dev/null || true
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [ -x "$LSREG" ]; then
     "$LSREG" -u "/Applications/GigaDictate.app" 2>/dev/null || true
-    if [ -n "{bundle_path}" ]; then
-        "$LSREG" -u "{bundle_path}" 2>/dev/null || true
+    if [ -n {safe_bundle} ]; then
+        "$LSREG" -u {safe_bundle} 2>/dev/null || true
     fi
     "$LSREG" -gc 2>/dev/null || true
 fi

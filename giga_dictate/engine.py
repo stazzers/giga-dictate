@@ -16,8 +16,8 @@ logger = logging.getLogger("giga_dictate.engine")
 # Optimize PyTorch CPU thread pool to prevent thread contention and background CPU wakeups
 try:
     torch.set_num_threads(min(4, os.cpu_count() or 1))
-except Exception:
-    pass
+except (RuntimeError, ValueError) as e:
+    logger.debug(f"PyTorch thread count setting error ignored: {e}")
 
 
 class GigaAMEngine:
