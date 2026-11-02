@@ -49,6 +49,31 @@ if [ -d "$PYTHON_FW" ]; then
     rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/_CodeSignature"
     rm -f "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/site-packages"
 
+    # Bundle runtime dylibs that Python depends on so the app runs without Homebrew
+    echo "Bundling standalone runtime dependencies (OpenSSL, SQLite, LZMA, MPDecimal)..."
+    cp -f /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib "$FRAMEWORKS_DIR/"
+    cp -f /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib "$FRAMEWORKS_DIR/"
+    cp -fL /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib "$FRAMEWORKS_DIR/libsqlite3.dylib"
+    cp -fL /opt/homebrew/opt/xz/lib/liblzma.5.dylib "$FRAMEWORKS_DIR/liblzma.5.dylib"
+    cp -fL /opt/homebrew/opt/mpdecimal/lib/libmpdec.4.dylib "$FRAMEWORKS_DIR/libmpdec.4.dylib"
+    chmod 755 "$FRAMEWORKS_DIR"/*.dylib
+
+    install_name_tool -id @rpath/libcrypto.3.dylib "$FRAMEWORKS_DIR/libcrypto.3.dylib"
+    install_name_tool -id @rpath/libssl.3.dylib "$FRAMEWORKS_DIR/libssl.3.dylib"
+    install_name_tool -change /opt/homebrew/Cellar/openssl@3/3.6.4/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$FRAMEWORKS_DIR/libssl.3.dylib" 2>/dev/null || true
+    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$FRAMEWORKS_DIR/libssl.3.dylib" 2>/dev/null || true
+    install_name_tool -id @rpath/libsqlite3.dylib "$FRAMEWORKS_DIR/libsqlite3.dylib"
+    install_name_tool -id @rpath/liblzma.5.dylib "$FRAMEWORKS_DIR/liblzma.5.dylib"
+    install_name_tool -id @rpath/libmpdec.4.dylib "$FRAMEWORKS_DIR/libmpdec.4.dylib"
+
+    DYNLOAD="$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/lib-dynload"
+    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$DYNLOAD/_hashlib.cpython-311-darwin.so"
+    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib @rpath/libssl.3.dylib "$DYNLOAD/_ssl.cpython-311-darwin.so"
+    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$DYNLOAD/_ssl.cpython-311-darwin.so"
+    install_name_tool -change /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib @rpath/libsqlite3.dylib "$DYNLOAD/_sqlite3.cpython-311-darwin.so"
+    install_name_tool -change /opt/homebrew/opt/xz/lib/liblzma.5.dylib @rpath/liblzma.5.dylib "$DYNLOAD/_lzma.cpython-311-darwin.so"
+    install_name_tool -change /opt/homebrew/opt/mpdecimal/lib/libmpdec.4.dylib @rpath/libmpdec.4.dylib "$DYNLOAD/_decimal.cpython-311-darwin.so"
+
     # Establish standard macOS framework symlinks for codesign compliance
     (
         cd "$FRAMEWORKS_DIR/Python.framework/Versions" && ln -sf 3.11 Current
@@ -137,8 +162,9 @@ install_name_tool -change \
 
 chmod +x "$MACOS_DIR/GigaDictate"
 
-# 7. Inside-out codesign: frameworks first, launcher binary, then application bundle
+# 7. Inside-out codesign: frameworks and dylibs first, launcher binary, then application bundle
 echo "Codesigning application bundle (inside-out)..."
+codesign -s - --force "$FRAMEWORKS_DIR"/*.dylib
 codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
 codesign -s - --force "$MACOS_DIR/GigaDictate"
 codesign -s - --force --entitlements "$DIR/entitlements.plist" "$APP_DIR"
