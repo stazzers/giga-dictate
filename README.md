@@ -37,12 +37,16 @@
 curl -fsSL https://raw.githubusercontent.com/stazzers/giga-dictate/main/install.sh | bash
 ```
 
-### Вариант 2. Запуск приложения macOS
-Вы можете запускать готовый бандл **`GigaDictate.app`**:
-```bash
-open GigaDictate.app
-```
-*(Или перетащите `GigaDictate.app` в папку `/Applications`)*.
+### Вариант 2. Ручная установка через DMG
+1. Скачайте `GigaDictate-arm64.dmg` со страницы [Releases](https://github.com/stazzers/giga-dictate/releases/latest).
+2. Откройте DMG и перетащите `GigaDictate.app` в папку **«Программы»** (`/Applications`).
+3. Так как приложение распространяется как Open-Source без платного сертификата Apple Developer ID (\$99/год), macOS Gatekeeper при первом запуске покажет предупреждение о неизвестном разработчике.
+   - **Быстро снять ограничение через Терминал**:
+     ```bash
+     xattr -cr /Applications/GigaDictate.app
+     ```
+   - **Или через интерфейс macOS**:
+     Перейдите в **«Системные настройки» → «Конфиденциальность и безопасность»** (System Settings → Privacy & Security), прокрутите вниз до раздела «Безопасность» и нажмите **«Подтвердить вход» / «Всё равно открыть»** (*Open Anyway*).
 
 ### Вариант 3. Через скрипт запуска
 ```bash
