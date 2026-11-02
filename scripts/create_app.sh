@@ -17,6 +17,7 @@ mkdir -p "$RESOURCES_DIR"
 # Copy Icon
 if [ -f "$DIR/AppIcon.icns" ]; then
     cp "$DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+    cp "$DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon"
 fi
 
 # Create Info.plist (identical structure to SuperDictate)
@@ -32,7 +33,9 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>CFBundleExecutable</key>
     <string>GigaDictate</string>
     <key>CFBundleIconFile</key>
-    <string>AppIcon.icns</string>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.salute.gigadictate</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -92,10 +95,26 @@ if os.path.exists(icns_path):
 
 lsreg = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 if os.path.exists(lsreg):
-    subprocess.run([lsreg, '-f', '/Applications/GigaDictate.app'])
+    subprocess.run([lsreg, '-f', '-r', '/Applications/GigaDictate.app'])
 "
 
-# Refresh Finder and Dock icon cache
-killall Finder 2>/dev/null || true
+# Invalidate and purge macOS Dock, Launchpad, and IconServices caches
+CACHE_DIR=$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || echo "")
+TEMP_DIR=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "")
+
+if [ -n "$CACHE_DIR" ]; then
+    rm -f "${CACHE_DIR}com.apple.dock.iconcache" 2>/dev/null || true
+    rm -rf "${CACHE_DIR}com.apple.iconservices"* 2>/dev/null || true
+fi
+
+if [ -n "$TEMP_DIR" ]; then
+    rm -rf "${TEMP_DIR}com.apple.iconservices"* 2>/dev/null || true
+fi
+
+# Re-register bundle in LaunchServices
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -r "/Applications/GigaDictate.app" 2>/dev/null || true
+
+# Refresh Finder and Dock so caches are reloaded from bundle resources
+killall Dock Finder 2>/dev/null || true
 
 echo "Installed successfully in /Applications/GigaDictate.app with updated white-toned icon!"
