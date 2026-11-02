@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+AppIcon.iconset/
+*.wav
+.DS_Store
+GigaAM_repo/
+GigaDictate.app/
+launcher
+*.log
