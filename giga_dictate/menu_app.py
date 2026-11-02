@@ -73,7 +73,11 @@ def _set_thread_qos_user_interactive():
         logger.debug(f"Could not set thread QoS: {e}")
 
 
-_WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaWorker")
+_WORKER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="GigaWorker",
+    initializer=_set_thread_qos_user_interactive,
+)
 _PREVIEW_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="GigaPreview",
@@ -660,6 +664,7 @@ class MenuAppController(NSObject):
         audio, duration = self.recorder.stop()
 
         def _worker():
+            _set_thread_qos_user_interactive()
             if duration < self.config.min_duration or len(audio) == 0:
                 logger.info(f"Audio too short ({duration:.2f}s), skipping.")
                 self.sounds.play_cancel()

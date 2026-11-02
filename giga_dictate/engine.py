@@ -167,50 +167,56 @@ class GigaAMEngine:
         if len(audio) == 0:
             return ""
 
-        chunks = split_audio_into_chunks(audio, sr=sample_rate, max_sec=20.0)
+        if not isinstance(audio, np.ndarray):
+            audio = np.asarray(audio)
+        if audio.ndim != 1:
+            audio = audio.ravel()
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32, copy=False)
+
+        if len(audio) <= int(20.0 * sample_rate):
+            chunks = [audio]
+        else:
+            chunks = split_audio_into_chunks(audio, sr=sample_rate, max_sec=20.0)
+
         results: list[str] = []
 
         with self._lock:
-            try:
-                for chunk in chunks:
-                    if len(chunk) < int(0.2 * sample_rate):
-                        continue
+            for chunk in chunks:
+                if len(chunk) < int(0.2 * sample_rate):
+                    continue
 
-                    wav = None
-                    length = None
-                    encoded = None
-                    encoded_len = None
-                    try:
-                        wav = torch.as_tensor(
-                            chunk,
-                            dtype=self.model._dtype,
-                            device=self.model._device,
-                        ).unsqueeze(0)
-                        length = torch.full(
-                            [1], wav.shape[-1], device=self.model._device
-                        )
+                wav = None
+                length = None
+                encoded = None
+                encoded_len = None
+                try:
+                    wav = torch.as_tensor(
+                        chunk,
+                        dtype=self.model._dtype,
+                        device=self.model._device,
+                    ).unsqueeze(0)
+                    length = torch.full(
+                        [1], wav.shape[-1], device=self.model._device
+                    )
 
-                        encoded, encoded_len = self.model.forward(wav, length)
-                        decoded = self.model._decode(
-                            encoded, encoded_len, length, word_timestamps=False
+                    encoded, encoded_len = self.model.forward(wav, length)
+                    decoded = self.model._decode(
+                        encoded, encoded_len, length, word_timestamps=False
+                    )
+                    if decoded and len(decoded) > 0 and decoded[0] is not None:
+                        first = decoded[0]
+                        raw = (
+                            first[0]
+                            if isinstance(first, (list, tuple)) and len(first) > 0
+                            else first
                         )
-                        if decoded and len(decoded) > 0 and decoded[0] is not None:
-                            first = decoded[0]
-                            raw = (
-                                first[0]
-                                if isinstance(first, (list, tuple)) and len(first) > 0
-                                else first
-                            )
-                            if isinstance(raw, str):
-                                text = raw.strip()
-                                if text:
-                                    results.append(text)
-                    finally:
-                        del wav, length, encoded, encoded_len
-            finally:
-                if self.device_str == "mps" and torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-                gc.collect()
+                        if isinstance(raw, str):
+                            text = raw.strip()
+                            if text:
+                                results.append(text)
+                finally:
+                    del wav, length, encoded, encoded_len
 
         full_text = " ".join(results)
         # Normalize repeated spaces
