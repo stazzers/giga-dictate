@@ -120,6 +120,22 @@ class TestPerformanceOptimizations(unittest.TestCase):
         threads_after = threading.active_count()
         self.assertLessEqual(threads_after - threads_before, 1)
 
+    def test_audio_recorder_rapid_toggle_safety(self):
+        """AudioRecorder can be started and stopped in rapid bursts without deadlock or race."""
+        recorder = AudioRecorder()
+        try:
+            for _ in range(5):
+                started = recorder.start()
+                self.assertTrue(started)
+                self.assertTrue(recorder.is_recording)
+                time.sleep(0.02)
+                audio, dur = recorder.stop()
+                self.assertFalse(recorder.is_recording)
+                self.assertIsInstance(audio, np.ndarray)
+                self.assertGreaterEqual(dur, 0.0)
+        finally:
+            recorder.close()
+
 
 if __name__ == "__main__":
     unittest.main()

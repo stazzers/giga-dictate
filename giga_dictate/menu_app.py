@@ -616,7 +616,7 @@ class MenuAppController(NSObject):
         if self.recorder.is_recording:
             self.stop_and_transcribe()
         else:
-            self.start_recording()
+            self.start_recording(manual=True)
 
     def on_hotkey_start(self):
         """Called by hotkey listener on background thread."""
@@ -628,7 +628,7 @@ class MenuAppController(NSObject):
         logger.info("on_hotkey_stop -> dispatching stop_and_transcribe to main thread")
         AppHelper.callAfter(self.stop_and_transcribe)
 
-    def start_recording(self):
+    def start_recording(self, manual: bool = False):
         logger.info("start_recording executing on main thread")
         if not self.engine.is_loaded:
             logger.info(
@@ -653,23 +653,26 @@ class MenuAppController(NSObject):
             self.ducker.unduck()
             self._stop_preview_timer()
             self.sounds.play_cancel()
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("Ошибка доступа к микрофону")
-            alert.setInformativeText_(
-                "GigaDictate не удалось запустить запись аудио.\n\n"
-                "Проверьте, включен ли тумблер в:\n"
-                "Системные настройки → Конфиденциальность и безопасность → Микрофон."
-            )
-            alert.addButtonWithTitle_("Открыть Настройки микрофона")
-            alert.addButtonWithTitle_("Отмена")
-            if alert.runModal() == NSAlertFirstButtonReturn:
-                try:
-                    url = NSURL.URLWithString_(
-                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-                    )
-                    NSWorkspace.sharedWorkspace().openURL_(url)
-                except Exception as e:
-                    logger.debug(f"Open URL error: {e}")
+            self.update_status_title(" ⚠️ Ошибка микрофона")
+            self.update_menu_status()
+            if manual:
+                alert = NSAlert.alloc().init()
+                alert.setMessageText_("Ошибка доступа к микрофону")
+                alert.setInformativeText_(
+                    "GigaDictate не удалось запустить запись аудио.\n\n"
+                    "Проверьте, включен ли тумблер в:\n"
+                    "Системные настройки → Конфиденциальность и безопасность → Микрофон."
+                )
+                alert.addButtonWithTitle_("Открыть Настройки микрофона")
+                alert.addButtonWithTitle_("Отмена")
+                if alert.runModal() == NSAlertFirstButtonReturn:
+                    try:
+                        url = NSURL.URLWithString_(
+                            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                        )
+                        NSWorkspace.sharedWorkspace().openURL_(url)
+                    except Exception as e:
+                        logger.debug(f"Open URL error: {e}")
 
     def stop_and_transcribe(self):
         logger.info("stop_and_transcribe executing on main thread")
