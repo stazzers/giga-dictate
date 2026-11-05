@@ -650,9 +650,11 @@ class MenuAppController(NSObject):
                 self._start_preview_timer()
         else:
             logger.warning("recorder.start() returned False (Microphone access or device issue)")
+            self.hotkey_listener.reset_state()
             self.ducker.unduck()
             self._stop_preview_timer()
             self.sounds.play_cancel()
+            self.hud.hide()
             self.update_status_title(" ⚠️ Ошибка микрофона")
             self.update_menu_status()
             if manual:
@@ -683,6 +685,10 @@ class MenuAppController(NSObject):
             self.engine.reset_preview_cache()
         if not self.recorder.is_recording:
             logger.warning("stop_and_transcribe called, but recorder is not recording.")
+            self.hotkey_listener.reset_state()
+            self.hud.hide()
+            self.update_status_title("")
+            self.update_menu_status()
             return
 
         self.update_status_title("Обработка...")

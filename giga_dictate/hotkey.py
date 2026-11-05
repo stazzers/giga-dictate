@@ -354,6 +354,11 @@ class HotkeyListener:
 
         return True
 
+    def reset_state(self) -> None:
+        """Resets active and key-down states to idle to prevent lockouts on error."""
+        self._is_active = False
+        self._is_key_down = False
+
     def _tap_callback(self, proxy, event_type, event, refcon):
         # 1. Automatically re-enable if macOS WindowServer disables tap due to timeout
         if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):

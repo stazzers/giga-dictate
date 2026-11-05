@@ -1,7 +1,6 @@
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import sounddevice as sd
@@ -9,7 +8,6 @@ import sounddevice as sd
 logger = logging.getLogger("giga_dictate.audio")
 
 SAMPLE_RATE = 16000
-_TEARDOWN_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="AudioTeardown")
 
 
 def split_audio_into_chunks(
@@ -151,12 +149,12 @@ class AudioRecorder:
             logger.warning(f"Audio stream status: {status}")
 
         if not self._recording:
-            # Raising CallbackStop halts PortAudio cleanly from inside CoreAudio IOThread
-            raise sd.CallbackStop
+            return
 
         with self._lock:
-            if self._recording:
-                self._frames.append(indata.copy())
+            if not self._recording:
+                return
+            self._frames.append(indata.copy())
 
         try:
             flat = indata.ravel()
@@ -197,47 +195,37 @@ class AudioRecorder:
         except Exception as e:
             logger.debug(f"Audio volume computation error ignored: {e}")
 
-    @staticmethod
-    def _safe_close_stream(s: sd.InputStream | None):
-        """Safely stops and closes a PortAudio stream without CoreAudio reverse deadlocks."""
-        if s is None:
-            return
-        try:
-            # When CallbackStop is raised, stream becomes inactive in ~10-30ms
-            t0 = time.time()
-            while s.active and (time.time() - t0 < 0.15):
-                time.sleep(0.01)
-
-            # If still active after timeout, stop it gently
-            if s.active:
-                try:
-                    s.stop()
-                except Exception as ex:
-                    logger.debug(f"Stream stop fallback ignored: {ex}")
-
-            s.close()
-            logger.info("Microphone deactivated: stream closed completely.")
-        except Exception as e:
-            logger.debug(f"Stream close error ignored: {e}")
-
     def start(self) -> bool:
         """
         Activates the microphone and starts capturing audio frames.
         Thread-safe, non-blocking, and deadlock-free.
+        Reuses persistent InputStream across recordings so CoreAudio IOProc
+        is not repeatedly created and destroyed.
         """
         with self._stream_mutex:
-            # If an existing stream was not detached, close it in background
-            if self._stream is not None:
-                old_stream = self._stream
-                self._stream = None
-                _TEARDOWN_POOL.submit(self._safe_close_stream, old_stream)
-
             with self._lock:
                 self._frames = []
                 self._recording = True
                 self._current_level = 0.0
 
-            # Open InputStream with 1 automatic retry on transient CoreAudio switch
+            # 1. Try resuming existing stream
+            if self._stream is not None and not self._stream.closed:
+                try:
+                    if self._stream.stopped:
+                        self._stream.start()
+                    logger.info("Microphone activated: stream resumed.")
+                    return True
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to resume existing audio stream: {e}. Reopening stream..."
+                    )
+                    try:
+                        self._stream.close()
+                    except Exception as ex:
+                        logger.debug(f"Stream close fallback error ignored: {ex}")
+                    self._stream = None
+
+            # 2. Build and start new stream if needed
             for attempt in range(2):
                 try:
                     self._stream = sd.InputStream(
@@ -259,7 +247,7 @@ class AudioRecorder:
                         try:
                             self._stream.close()
                         except Exception as ex:
-                            logger.debug(f"Stream close fallback error ignored: {ex}")
+                            logger.debug(f"Stream close retry error ignored: {ex}")
                         self._stream = None
                     if attempt == 0:
                         time.sleep(0.05)
@@ -270,8 +258,9 @@ class AudioRecorder:
 
     def stop(self) -> tuple[np.ndarray, float]:
         """
-        Stops recording and immediately schedules microphone release.
-        Returns audio frames instantly without waiting for hardware teardown.
+        Stops recording and immediately pauses microphone IO.
+        Signals CoreAudio to stop IOProc, turning off the macOS privacy indicator.
+        Returns audio frames instantly.
         """
         with self._lock:
             if not self._recording:
@@ -281,24 +270,36 @@ class AudioRecorder:
             frames = self._frames
             self._frames = []
 
+        with self._stream_mutex:
+            if self._stream is not None and not self._stream.closed:
+                try:
+                    if self._stream.active:
+                        self._stream.stop()
+                    logger.info("Microphone deactivated: stream stopped cleanly.")
+                except Exception as e:
+                    logger.debug(f"Stream stop error ignored: {e}")
+
         if frames:
             audio = np.concatenate(frames, axis=0).ravel()
         else:
             audio = np.array([], dtype=np.float32)
         duration = len(audio) / self.sample_rate
 
-        # Detach current stream immediately so next start() can initialize cleanly
-        stream_to_close = self._stream
-        self._stream = None
-
-        if stream_to_close is not None:
-            _TEARDOWN_POOL.submit(self._safe_close_stream, stream_to_close)
-
         return audio, duration
 
     def set_device(self, device: int | None):
         """Sets the preferred audio device (takes effect on next recording)."""
-        self.device = device
+        with self._stream_mutex:
+            if self.device != device:
+                self.device = device
+                if self._stream is not None:
+                    try:
+                        if self._stream.active:
+                            self._stream.stop()
+                        self._stream.close()
+                    except Exception as ex:
+                        logger.debug(f"Device change stream close error ignored: {ex}")
+                    self._stream = None
 
     def close(self):
         """Immediately closes any active stream on application shutdown."""
@@ -306,6 +307,10 @@ class AudioRecorder:
             self._recording = False
         with self._stream_mutex:
             if self._stream is not None:
-                s = self._stream
+                try:
+                    if self._stream.active:
+                        self._stream.stop()
+                    self._stream.close()
+                except Exception as ex:
+                    logger.debug(f"Stream close on shutdown error ignored: {ex}")
                 self._stream = None
-                self._safe_close_stream(s)

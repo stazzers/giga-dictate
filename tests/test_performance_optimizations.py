@@ -1,14 +1,13 @@
-import os
-import sys
 import threading
 import time
 import unittest
 from unittest.mock import patch
+
 import numpy as np
 from AppKit import NSPasteboard, NSStringPboardType
 
 from giga_dictate.audio import AudioRecorder, split_audio_into_chunks
-from giga_dictate.config import AppConfig, get_default_device
+from giga_dictate.config import get_default_device
 from giga_dictate.hotkey import HotkeyListener, parse_hotkey
 from giga_dictate.inserter import TextInserter
 from giga_dictate.sounds import SoundManager
@@ -84,7 +83,7 @@ class TestPerformanceOptimizations(unittest.TestCase):
         class DummyEvent:
             pass
 
-        dummy = DummyEvent()
+        _ = DummyEvent()
         # Verify callback passes through non-target keycode without modifying state
         # In hotkey.py, vk != self.target_vk returns event immediately
         self.assertFalse(listener._is_active)
@@ -124,11 +123,11 @@ class TestPerformanceOptimizations(unittest.TestCase):
         """AudioRecorder can be started and stopped in rapid bursts without deadlock or race."""
         recorder = AudioRecorder()
         try:
-            for _ in range(5):
+            for _ in range(20):
                 started = recorder.start()
                 self.assertTrue(started)
                 self.assertTrue(recorder.is_recording)
-                time.sleep(0.02)
+                time.sleep(0.04)
                 audio, dur = recorder.stop()
                 self.assertFalse(recorder.is_recording)
                 self.assertIsInstance(audio, np.ndarray)
