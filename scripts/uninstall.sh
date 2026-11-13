@@ -35,6 +35,7 @@ tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset ListenEvent "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset SpeechRecognition "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
 tccutil reset All "$BUNDLE_ID" 2>/dev/null || true
 
 # 5. Очистка автозагрузки, конфигурации и кэша моделей нейросети (~900 МБ)

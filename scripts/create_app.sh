@@ -9,6 +9,10 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 
+# Fail before replacing the previous local build if meeting assets are missing.
+cd "$DIR"
+"$DIR/.venv/bin/python" -c 'import ScreenCaptureKit, AVFoundation, CoreMedia, CoreAudio, onnxruntime, kaldi_native_fbank, soxr; from giga_dictate.meeting_models import verify_models; verify_models("build/meeting_models")'
+
 echo "================================================="
 echo " Building Standalone $APP_NAME (Apple Silicon)  "
 echo "================================================="
@@ -28,6 +32,7 @@ fi
 echo "Bundling Python modules into Resources..."
 cp -R "$DIR/giga_dictate" "$RESOURCES_DIR/giga_dictate"
 cp -R "$DIR/GigaAM_repo" "$RESOURCES_DIR/GigaAM_repo"
+cp -R "$DIR/build/meeting_models" "$RESOURCES_DIR/meeting_models"
 # Clean .git, tests, and __pycache__ from bundle
 rm -rf "$RESOURCES_DIR/GigaAM_repo/.git"
 rm -rf "$RESOURCES_DIR/GigaAM_repo/tests"
@@ -140,9 +145,9 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0.3</string>
+    <string>3.0.1</string>
     <key>CFBundleVersion</key>
-    <string>2.0.3</string>
+    <string>3.0.1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>
@@ -152,7 +157,9 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>NSAppleEventsUsageDescription</key>
     <string>GigaDictate использует события ввода для вставки распознанного текста под курсор.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>GigaDictate записывает аудио при активации горячей клавиши и распознает речь локально с помощью GigaAM-v3.</string>
+    <string>GigaDictate записывает микрофон при диктовке, записи встречи или калибровке голоса. Обработка выполняется локально.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>В режиме созвона GigaDictate захватывает системный звук для локальной стенограммы. Изображение экрана не сохраняется.</string>
 </dict>
 </plist>
 EOF

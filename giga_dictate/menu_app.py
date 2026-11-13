@@ -42,6 +42,7 @@ from AppKit import (
 from Foundation import NSBundle, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 from PyObjCTools import AppHelper
 
+from . import __version__
 from .audio import AudioRecorder
 from .config import AppConfig, is_launch_at_login_enabled, set_launch_at_login
 from .ducking import AudioDucker
@@ -164,6 +165,8 @@ class MenuAppController(NSObject):
         )
         self.inserter = TextInserter()
         self.ducker = AudioDucker()
+        from .meeting_ui import MeetingUI
+        self.meeting_ui = MeetingUI.alloc().initWithController_(self)
 
         self.status_item = None
         self.menu = None
@@ -315,7 +318,7 @@ class MenuAppController(NSObject):
 
     @objc.IBAction
     def onRetryModelLoad_(self, sender):
-        if self.session.busy or self._model_reloading:
+        if self.session.busy or self._model_reloading or self._meeting_busy():
             return
         self._model_reloading = True
         logger.info("Retrying model load by user request...")
@@ -357,7 +360,10 @@ class MenuAppController(NSObject):
         menu.setAutoenablesItems_(False)
 
         # 1. Header / Status
-        if self.session.state == DictationState.TRANSCRIBING:
+        meeting_busy = self._meeting_busy()
+        if meeting_busy:
+            status_text = "🔴 Встреча: запись или обработка"
+        elif self.session.state == DictationState.TRANSCRIBING:
             status_text = "⏳ Распознавание..."
         elif self.session.state == DictationState.INSERTING:
             status_text = "⏳ Отправка вставки..."
@@ -413,9 +419,24 @@ class MenuAppController(NSObject):
             action_title, "onMenuToggleRecord:", ""
         )
         toggle_item.setTarget_(self)
-        toggle_item.setEnabled_(self.engine.is_loaded and not self._model_reloading and self.session.state not in (DictationState.TRANSCRIBING, DictationState.INSERTING))
+        toggle_item.setEnabled_(not meeting_busy and self.engine.is_loaded and not self._model_reloading and self.session.state not in (DictationState.TRANSCRIBING, DictationState.INSERTING))
         menu.addItem_(toggle_item)
         self._toggle_menu_item = toggle_item
+
+        meeting = getattr(self, "meeting_ui", None)
+        if meeting is not None:
+            for title, action, enabled in (
+                ("⏹ Завершить встречу" if meeting.session.busy else "🎙 Начать встречу / созвон…",
+                 "onStart:", not self.session.busy and not self._model_reloading and not meeting.preparing_assets),
+                ("Открыть стенограмму встречи", "onShowResult:", meeting.result is not None),
+                ("Подготовить модели встреч…", "onPrepareModels:", not meeting_busy and not self.session.busy),
+                ("Записать мой голос (20 сек)…", "onEnroll:", not meeting_busy and not self.session.busy and not self._model_reloading),
+                ("Удалить мой голосовой профиль", "onDeleteProfile:", not meeting_busy),
+            ):
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+                item.setTarget_(meeting)
+                item.setEnabled_(enabled)
+                menu.addItem_(item)
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -426,7 +447,7 @@ class MenuAppController(NSObject):
         ):
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
             item.setTarget_(self)
-            item.setEnabled_(bool(self.recovery.get()) and not self.session.busy)
+            item.setEnabled_(bool(self.recovery.get()) and not self.session.busy and not meeting_busy)
             menu.addItem_(item)
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -444,7 +465,7 @@ class MenuAppController(NSObject):
             if self.config.model_name == m_id:
                 m_item.setState_(1)  # Checked
             model_sub.addItem_(m_item)
-        model_menu_item.setEnabled_(not self.session.busy and not self._model_reloading)
+        model_menu_item.setEnabled_(not self.session.busy and not self._model_reloading and not meeting_busy)
         model_menu_item.setSubmenu_(model_sub)
         menu.addItem_(model_menu_item)
 
@@ -470,7 +491,7 @@ class MenuAppController(NSObject):
         if self.config.hotkey_mode == "toggle":
             tog_item.setState_(1)
         mode_sub.addItem_(tog_item)
-        mode_menu_item.setEnabled_(not self.session.busy)
+        mode_menu_item.setEnabled_(not self.session.busy and not meeting_busy)
         mode_menu_item.setSubmenu_(mode_sub)
         menu.addItem_(mode_menu_item)
 
@@ -511,7 +532,7 @@ class MenuAppController(NSObject):
         record_item.setTarget_(self)
         hotkey_sub.addItem_(record_item)
 
-        hotkey_menu_item.setEnabled_(not self.session.busy)
+        hotkey_menu_item.setEnabled_(not self.session.busy and not meeting_busy)
         hotkey_menu_item.setSubmenu_(hotkey_sub)
         menu.addItem_(hotkey_menu_item)
 
@@ -620,6 +641,10 @@ class MenuAppController(NSObject):
         # Also updates availability of recovery commands and model/hotkey changes.
         self.rebuild_menu()
 
+    def _meeting_busy(self):
+        meeting = getattr(self, "meeting_ui", None)
+        return meeting is not None and meeting.busy
+
     # --- Actions ---
 
     def onMenuToggleRecord_(self, sender):
@@ -639,6 +664,9 @@ class MenuAppController(NSObject):
         AppHelper.callAfter(self.stop_and_transcribe)
 
     def start_recording(self, manual: bool = False):
+        if self._meeting_busy():
+            self.hotkey_listener.reset_state()
+            return
         if self._model_reloading:
             self.hotkey_listener.reset_state()
             self.sounds.play_cancel()
@@ -691,7 +719,11 @@ class MenuAppController(NSObject):
         logger.info("recording_stopped session=%s duration_s=%.3f", generation, duration)
 
         def worker():
-            if duration < self.config.min_duration or len(audio) == 0:
+            if len(audio) == 0:
+                AppHelper.callAfter(self._transcription_ready, generation, "",
+                    "Микрофон не передаёт звук. Повторите запись и проверьте устройство ввода macOS.")
+                return
+            if duration < self.config.min_duration:
                 AppHelper.callAfter(self._transcription_ready, generation, "", "Запись слишком короткая")
                 return
             t0 = time.monotonic()
@@ -792,6 +824,8 @@ class MenuAppController(NSObject):
         self.update_menu_status()
 
     def onRetryInsertion_(self, sender):
+        if self._meeting_busy():
+            return
         text = self.recovery.get()
         if not text or not self.session.begin():
             self.sounds.play_cancel()
@@ -802,7 +836,7 @@ class MenuAppController(NSObject):
         AppHelper.callLater(0.15, self._insert_result, generation, text)
 
     def onCopyLastText_(self, sender):
-        if self.session.busy:
+        if self.session.busy or self._meeting_busy():
             return
         result = self.inserter.copy_text(self.recovery.get(), self.config.conceal_clipboard)
         if not result:
@@ -896,7 +930,7 @@ class MenuAppController(NSObject):
             self.hud.setPreviewText_(text)
 
     def onSelectModel_(self, sender):
-        if self.session.busy or self._model_reloading:
+        if self.session.busy or self._model_reloading or self._meeting_busy():
             return
         new_model = sender.representedObject()
         if new_model == self.config.model_name:
@@ -915,7 +949,7 @@ class MenuAppController(NSObject):
         _WORKER_EXECUTOR.submit(_reload)
 
     def onSelectDevice_(self, sender):
-        if self.session.busy or self._model_reloading:
+        if self.session.busy or self._model_reloading or self._meeting_busy():
             return
         new_device = sender.representedObject()
         if new_device == self.config.device:
@@ -934,7 +968,7 @@ class MenuAppController(NSObject):
         _WORKER_EXECUTOR.submit(_reload)
 
     def onSelectMode_(self, sender):
-        if self.session.busy:
+        if self.session.busy or self._meeting_busy():
             return
         new_mode = sender.representedObject()
         self.config.hotkey_mode = new_mode
@@ -943,7 +977,7 @@ class MenuAppController(NSObject):
         self.rebuild_menu()
 
     def onSelectDefaultHotkey_(self, sender):
-        if self.session.busy:
+        if self.session.busy or self._meeting_busy():
             return
         if self.config.hotkey == "right_cmd":
             return
@@ -954,7 +988,7 @@ class MenuAppController(NSObject):
         self.rebuild_menu()
 
     def onSelectCustomHotkey_(self, sender):
-        if self.session.busy:
+        if self.session.busy or self._meeting_busy():
             return
         if not self.config.custom_hotkey:
             self.onCustomHotkeyDialog_(sender)
@@ -967,7 +1001,7 @@ class MenuAppController(NSObject):
         self.rebuild_menu()
 
     def onCustomHotkeyDialog_(self, sender):
-        if self.session.busy:
+        if self.session.busy or self._meeting_busy():
             return
         """Opens automatic key recorder window where pressing any key captures it."""
         self._open_key_capture_window()
@@ -1226,7 +1260,7 @@ class MenuAppController(NSObject):
         alert = NSAlert.alloc().init()
         alert.setMessageText_("О программе GigaDictate")
         alert.setInformativeText_(
-            "GigaDictate — локальное высокоскоростное голосовое распознавание для macOS.\n\n"
+            f"GigaDictate {__version__} — локальное высокоскоростное голосовое распознавание для macOS.\n\n"
             "• Основано на моделях Salute Developers GigaAM-v3\n"
             "• Ускорение на Apple Silicon (MPS / Metal)\n"
             "• Автоматическая пунктуация и капитализация\n"
@@ -1236,6 +1270,9 @@ class MenuAppController(NSObject):
         alert.runModal()
 
     def onUninstallAppDialog_(self, sender):
+        meeting = getattr(self, "meeting_ui", None)
+        if meeting and not meeting.request_quit():
+            return
         alert = NSAlert.alloc().init()
         alert.setMessageText_("Вы действительно хотите полностью удалить GigaDictate?")
         alert.setInformativeText_(
@@ -1257,6 +1294,9 @@ class MenuAppController(NSObject):
         self.execute_complete_uninstallation()
 
     def execute_complete_uninstallation(self):
+        meeting = getattr(self, "meeting_ui", None)
+        if meeting and not meeting.request_quit():
+            return
         logger.info("Executing complete uninstallation...")
         self._shutdown()
 
@@ -1320,6 +1360,9 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
         self.restart_application()
 
     def restart_application(self):
+        meeting = getattr(self, "meeting_ui", None)
+        if meeting and not meeting.request_quit():
+            return
         logger.info("Restarting application...")
         self._shutdown()
         from AppKit import NSURL, NSWorkspace
@@ -1333,6 +1376,9 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
         if self._shutting_down:
             return
         self._shutting_down = True
+        meeting = getattr(self, "meeting_ui", None)
+        if meeting:
+            meeting.close()
         self.session.invalidate()
         self._preview_session_id += 1
         self.recovery.clear()
@@ -1359,5 +1405,11 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
         self._shutdown()
 
     def onQuitApp_(self, sender):
-        self._shutdown()
         NSApplication.sharedApplication().terminate_(self)
+
+    def applicationShouldTerminate_(self, sender):
+        from AppKit import NSTerminateCancel, NSTerminateNow
+        meeting = getattr(self, "meeting_ui", None)
+        if meeting and not meeting.request_quit():
+            return NSTerminateCancel
+        return NSTerminateNow

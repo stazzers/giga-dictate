@@ -1,0 +1,10 @@
+# Python 3.11, macOS arm64; existing GigaAM/PyTorch environment required.
+pyobjc-framework-ScreenCaptureKit==13.0
+pyobjc-framework-AVFoundation==13.0
+pyobjc-framework-CoreMedia==13.0
+pyobjc-framework-CoreAudio==13.0
+onnxruntime==1.23.2
+onnx==1.19.1
+silero-vad==6.2.0
+kaldi-native-fbank==1.22.3
+soxr==1.0.0
