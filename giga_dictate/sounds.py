@@ -32,7 +32,7 @@ class SoundManager:
         self.play("Pop")
 
     def play_success(self) -> None:
-        """Transcription pasted successfully."""
+        """Paste events sent; the target app does not acknowledge delivery."""
         self.play("Hero")
 
     def play_cancel(self) -> None:

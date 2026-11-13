@@ -72,6 +72,7 @@ class AudioRecorder:
         self.device = device
         self._stream: sd.InputStream | None = None
         self._frames: list[np.ndarray] = []
+        self._sample_count = 0
         self._recording = False
         self._current_level = 0.0
         self._speech_speed = 1.0
@@ -144,6 +145,30 @@ class AudioRecorder:
             audio = audio[-max_samples:]
         return audio.astype(np.float32, copy=False)
 
+    def get_stream_snapshot_from(self, offset: int) -> np.ndarray:
+        """Copy only uncommitted samples; call on the preview worker, not the UI.
+
+        Audio frames remain immutable after capture. Copy their references under
+        the lock and concatenate outside it, keeping the real-time callback free.
+        """
+        with self._lock:
+            if not self._recording:
+                return np.array([], dtype=np.float32)
+            end = self._sample_count
+            selected = []
+            for frame in reversed(self._frames):
+                start = end - len(frame)
+                if end <= offset:
+                    break
+                selected.append(frame[max(0, offset - start):])
+                end = start
+        selected.reverse()
+        if not selected:
+            return np.array([], dtype=np.float32)
+        if len(selected) == 1:
+            return selected[0].ravel().astype(np.float32, copy=False)
+        return np.concatenate(selected, axis=0).ravel().astype(np.float32, copy=False)
+
     def _callback(self, indata, frames, time_info, status):
         if status:
             logger.warning(f"Audio stream status: {status}")
@@ -155,6 +180,7 @@ class AudioRecorder:
             if not self._recording:
                 return
             self._frames.append(indata.copy())
+            self._sample_count += len(indata)
 
         try:
             flat = indata.ravel()
@@ -205,6 +231,7 @@ class AudioRecorder:
         with self._stream_mutex:
             with self._lock:
                 self._frames = []
+                self._sample_count = 0
                 self._recording = True
                 self._current_level = 0.0
 
@@ -269,6 +296,7 @@ class AudioRecorder:
             self._current_level = 0.0
             frames = self._frames
             self._frames = []
+            self._sample_count = 0
 
         with self._stream_mutex:
             if self._stream is not None and not self._stream.closed:

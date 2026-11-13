@@ -55,6 +55,7 @@ from .hotkey import (
 from .hud import VoiceInputHUD
 from .inserter import TextInserter
 from .sounds import SoundManager
+from .session import DictationSession, DictationState, RecoveryText
 
 logger = logging.getLogger("giga_dictate.menu_app")
 
@@ -149,6 +150,11 @@ class MenuAppController(NSObject):
         if self is None:
             return None
 
+        self._shutting_down = False
+        self.session = DictationSession()
+        self.recovery = RecoveryText()
+        self._recovery_timer = None
+        self._preview_future = None
         self.config = AppConfig.load()
         self.sounds = SoundManager(enabled=self.config.sound_feedback)
         self.recorder = AudioRecorder(device=self.config.audio_device)
@@ -196,6 +202,7 @@ class MenuAppController(NSObject):
         # Model download and loading tracking
         self._model_progress_str = ""
         self._model_error = None
+        self._model_reloading = False
 
         return self
 
@@ -292,13 +299,15 @@ class MenuAppController(NSObject):
             )
 
     def onModelLoaded_(self, _):
+        self._model_reloading = False
         self._model_error = None
         self._model_progress_str = ""
-        self.update_status_title("")
+        self.update_status_title("", recording=self.session.state == DictationState.RECORDING)
         self.rebuild_menu()
         logger.info("Ready for dictation.")
 
     def onModelError_(self, error_str):
+        self._model_reloading = False
         self._model_error = error_str
         self.update_status_title(" ⚠️")
         self.rebuild_menu()
@@ -306,6 +315,9 @@ class MenuAppController(NSObject):
 
     @objc.IBAction
     def onRetryModelLoad_(self, sender):
+        if self.session.busy or self._model_reloading:
+            return
+        self._model_reloading = True
         logger.info("Retrying model load by user request...")
         self._model_error = None
         self._model_progress_str = "Перезапуск загрузки..."
@@ -321,7 +333,7 @@ class MenuAppController(NSObject):
                     btn.setImage_(self.menu_icon_rec)
                 btn.setImagePosition_(NSImageOnly)
                 btn.setTitle_("")
-            elif self._model_error:
+            elif self._model_error or self.session.state == DictationState.ERROR:
                 if self.menu_icon:
                     btn.setImage_(self.menu_icon)
                 btn.setImagePosition_(NSImageLeft)
@@ -337,6 +349,7 @@ class MenuAppController(NSObject):
                     btn.setImage_(self.menu_icon)
                 btn.setImagePosition_(NSImageOnly)
                 btn.setTitle_("")
+            btn.setToolTip_(self.session.error if self.session.state == DictationState.ERROR else "GigaDictate — Голосовой ввод GigaAM-v3")
             self.status_item.setVisible_(True)
 
     def rebuild_menu(self):
@@ -344,7 +357,13 @@ class MenuAppController(NSObject):
         menu.setAutoenablesItems_(False)
 
         # 1. Header / Status
-        if self.recorder.is_recording:
+        if self.session.state == DictationState.TRANSCRIBING:
+            status_text = "⏳ Распознавание..."
+        elif self.session.state == DictationState.INSERTING:
+            status_text = "⏳ Отправка вставки..."
+        elif self.session.state == DictationState.ERROR:
+            status_text = f"⚠️ {self.session.error}"
+        elif self.session.state == DictationState.RECORDING:
             status_text = "🔴 Идет запись голоса..."
         elif self._model_error:
             status_text = f"⚠️ Ошибка: {self._model_error[:40]}"
@@ -388,16 +407,27 @@ class MenuAppController(NSObject):
 
         # 2. Manual toggle recording
         action_title = (
-            "⏹️ Остановить запись" if self.recorder.is_recording else "🎙️ Начать запись"
+            "⏹️ Остановить запись" if self.session.state == DictationState.RECORDING else "🎙️ Начать запись"
         )
         toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             action_title, "onMenuToggleRecord:", ""
         )
         toggle_item.setTarget_(self)
-        toggle_item.setEnabled_(self.engine.is_loaded)
+        toggle_item.setEnabled_(self.engine.is_loaded and not self._model_reloading and self.session.state not in (DictationState.TRANSCRIBING, DictationState.INSERTING))
         menu.addItem_(toggle_item)
         self._toggle_menu_item = toggle_item
 
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        for title, action in (
+            ("Повторить вставку", "onRetryInsertion:"),
+            ("Скопировать последний текст", "onCopyLastText:"),
+            ("Очистить последний текст", "onClearLastText:"),
+        ):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+            item.setTarget_(self)
+            item.setEnabled_(bool(self.recovery.get()) and not self.session.busy)
+            menu.addItem_(item)
         menu.addItem_(NSMenuItem.separatorItem())
 
         # 3. Model Submenu
@@ -414,6 +444,7 @@ class MenuAppController(NSObject):
             if self.config.model_name == m_id:
                 m_item.setState_(1)  # Checked
             model_sub.addItem_(m_item)
+        model_menu_item.setEnabled_(not self.session.busy and not self._model_reloading)
         model_menu_item.setSubmenu_(model_sub)
         menu.addItem_(model_menu_item)
 
@@ -439,6 +470,7 @@ class MenuAppController(NSObject):
         if self.config.hotkey_mode == "toggle":
             tog_item.setState_(1)
         mode_sub.addItem_(tog_item)
+        mode_menu_item.setEnabled_(not self.session.busy)
         mode_menu_item.setSubmenu_(mode_sub)
         menu.addItem_(mode_menu_item)
 
@@ -479,6 +511,7 @@ class MenuAppController(NSObject):
         record_item.setTarget_(self)
         hotkey_sub.addItem_(record_item)
 
+        hotkey_menu_item.setEnabled_(not self.session.busy)
         hotkey_menu_item.setSubmenu_(hotkey_sub)
         menu.addItem_(hotkey_menu_item)
 
@@ -584,36 +617,13 @@ class MenuAppController(NSObject):
             self.status_item.setMenu_(menu)
 
     def update_menu_status(self):
-        """Updates dynamic status and toggle items in-place without rebuilding entire menu."""
-        if self._status_menu_item is None or self._toggle_menu_item is None:
-            self.rebuild_menu()
-            return
-
-        if self.recorder.is_recording:
-            status_text = "🔴 Идет запись голоса..."
-            action_title = "⏹️ Остановить запись"
-        elif not self.engine.is_loaded:
-            status_text = "⏳ Загрузка модели GigaAM-v3..."
-            action_title = "🎙️ Начать запись"
-        else:
-            mode_desc = (
-                "Удерживайте"
-                if self.config.hotkey_mode == "push_to_talk"
-                else "Нажмите"
-            )
-            status_text = (
-                f"🟢 Готов к вводу ({mode_desc} {get_hotkey_display_name(self.config.hotkey)})"
-            )
-            action_title = "🎙️ Начать запись"
-
-        self._status_menu_item.setTitle_(status_text)
-        self._toggle_menu_item.setTitle_(action_title)
-        self._toggle_menu_item.setEnabled_(self.engine.is_loaded)
+        # Also updates availability of recovery commands and model/hotkey changes.
+        self.rebuild_menu()
 
     # --- Actions ---
 
     def onMenuToggleRecord_(self, sender):
-        if self.recorder.is_recording:
+        if self.session.state == DictationState.RECORDING:
             self.stop_and_transcribe()
         else:
             self.start_recording(manual=True)
@@ -629,120 +639,187 @@ class MenuAppController(NSObject):
         AppHelper.callAfter(self.stop_and_transcribe)
 
     def start_recording(self, manual: bool = False):
-        logger.info("start_recording executing on main thread")
-        if not self.engine.is_loaded:
-            logger.info(
-                "Model still warming up in background. Pre-roll recording started."
-            )
-
-        if self.recorder.start():
+        if self._model_reloading:
+            self.hotkey_listener.reset_state()
+            self.sounds.play_cancel()
+            return
+        if not self.session.begin():
+            self.sounds.play_cancel()
+            # A rejected hotkey START must not leave toggle mode logically active.
+            if self.session.state != DictationState.RECORDING:
+                self.hotkey_listener.reset_state()
+            return
+        generation = self.session.generation
+        try:
+            if not self.recorder.start():
+                self._finish_session(generation, "Не удалось включить микрофон")
+                return
+            self.hotkey_listener.set_recording(True)
             self._preview_session_id += 1
-            if getattr(self.config, "audio_ducking", True):
-                self.ducker.duck(target_volume=getattr(self.config, "ducking_volume", 0.12))
-            if hasattr(self.engine, "reset_preview_cache"):
-                self.engine.reset_preview_cache()
-            logger.info("Audio recording started! Showing HUD.")
+            self.engine.reset_preview_cache()
+            if self.config.audio_ducking:
+                self.ducker.duck(target_volume=self.config.ducking_volume)
             self.update_status_title("Запись...", recording=True)
             self.sounds.play_start()
             self.hud.showRecording()
             self.update_menu_status()
             if self.config.live_hud_preview:
                 self._start_preview_timer()
-        else:
-            logger.warning("recorder.start() returned False (Microphone access or device issue)")
-            self.hotkey_listener.reset_state()
-            self.ducker.unduck()
-            self._stop_preview_timer()
-            self.sounds.play_cancel()
-            self.hud.hide()
-            self.update_status_title(" ⚠️ Ошибка микрофона")
-            self.update_menu_status()
-            if manual:
-                alert = NSAlert.alloc().init()
-                alert.setMessageText_("Ошибка доступа к микрофону")
-                alert.setInformativeText_(
-                    "GigaDictate не удалось запустить запись аудио.\n\n"
-                    "Проверьте, включен ли тумблер в:\n"
-                    "Системные настройки → Конфиденциальность и безопасность → Микрофон."
-                )
-                alert.addButtonWithTitle_("Открыть Настройки микрофона")
-                alert.addButtonWithTitle_("Отмена")
-                if alert.runModal() == NSAlertFirstButtonReturn:
-                    try:
-                        url = NSURL.URLWithString_(
-                            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-                        )
-                        NSWorkspace.sharedWorkspace().openURL_(url)
-                    except Exception as e:
-                        logger.debug(f"Open URL error: {e}")
+            logger.info("session_started session=%s", generation)
+        except Exception:
+            logger.warning("recording_start_failed session=%s", generation)
+            self._finish_session(generation, "Ошибка запуска записи")
 
     def stop_and_transcribe(self):
-        logger.info("stop_and_transcribe executing on main thread")
+        if self.session.state != DictationState.RECORDING:
+            return
+        generation = self.session.generation
+        self.session.state = DictationState.TRANSCRIBING
         self._preview_session_id += 1
         self._stop_preview_timer()
         self.ducker.unduck()
-        if hasattr(self.engine, "reset_preview_cache"):
-            self.engine.reset_preview_cache()
-        if not self.recorder.is_recording:
-            logger.warning("stop_and_transcribe called, but recorder is not recording.")
-            self.hotkey_listener.reset_state()
-            self.hud.hide()
-            self.update_status_title("")
+        self.hotkey_listener.reset_state()
+        try:
+            audio, duration = self.recorder.stop()
+            self.sounds.play_stop()
+            self.hud.showTranscribing()
+            self.update_status_title("Обработка...")
             self.update_menu_status()
+        except Exception:
+            self._finish_session(generation, "Ошибка остановки записи")
             return
+        logger.info("recording_stopped session=%s duration_s=%.3f", generation, duration)
 
-        self.update_status_title("Обработка...")
-        self.sounds.play_stop()
-        self.hud.showTranscribing()
+        def worker():
+            if duration < self.config.min_duration or len(audio) == 0:
+                AppHelper.callAfter(self._transcription_ready, generation, "", "Запись слишком короткая")
+                return
+            t0 = time.monotonic()
+            try:
+                if not self.engine.is_loaded:
+                    self.engine.wait_loaded(timeout=15.0)
+                logger.info("model_wait session=%s elapsed_ms=%.1f", generation, (time.monotonic() - t0) * 1000)
+                if not self.engine.is_loaded:
+                    raise RuntimeError("model_unavailable")
+                t0 = time.monotonic()
+                text = self.engine.transcribe(audio)
+                logger.info("transcription_done session=%s elapsed_ms=%.1f chars=%s",
+                            generation, (time.monotonic() - t0) * 1000, len(text))
+                AppHelper.callAfter(self._transcription_ready, generation, text, "" if text else "Речь не распознана")
+            except Exception:
+                logger.warning("transcription_failed session=%s", generation)
+                AppHelper.callAfter(self._transcription_ready, generation, "", "Ошибка распознавания")
+        try:
+            _WORKER_EXECUTOR.submit(worker)
+        except RuntimeError:
+            self._finish_session(generation, "Обработка недоступна")
+
+    def _transcription_ready(self, generation, text, error):
+        if not self.session.accepts(generation) or self.session.state != DictationState.TRANSCRIBING:
+            return
+        if error:
+            self._finish_session(generation, error)
+            return
+        self.recovery.remember(text)
+        self._arm_recovery_expiry()
+        self._insert_result(generation, text)
+
+    def _insert_result(self, generation, text):
+        if not self.session.accepts(generation):
+            return
+        self.session.state = DictationState.INSERTING
+        self.update_menu_status()
+        try:
+            future = self.inserter.insert_text(
+                text, add_trailing_space=self.config.add_trailing_space,
+                restore_clipboard=self.config.restore_clipboard,
+                conceal_clipboard=self.config.conceal_clipboard, delay=self.config.paste_delay,
+            )
+            def done(completed):
+                AppHelper.callAfter(self._insertion_ready, generation, completed.result())
+            future.add_done_callback(done)
+        except Exception:
+            self._finish_session(generation, "Не удалось отправить вставку; текст доступен в меню")
+
+    def _insertion_ready(self, generation, result):
+        if not self.session.accepts(generation) or self.session.state != DictationState.INSERTING:
+            return
+        if result.event_posted:
+            self.sounds.play_success()
+            self._finish_session(generation)
+        else:
+            reasons = {
+                "accessibility_denied": "Нужен Универсальный доступ",
+                "modifiers_held": "Отпустите клавиши-модификаторы",
+                "target_changed": "Активное приложение изменилось",
+                "clipboard_changed": "Буфер обмена изменился",
+            }
+            message = reasons.get(result.reason, "Не удалось завершить вставку")
+            self._finish_session(generation, message)
+
+    def _finish_session(self, generation, error=""):
+        if not self.session.finish(generation, error):
+            return
+        self._stop_preview_timer()
+        self.ducker.unduck()
+        if self.recorder.is_recording:
+            try:
+                self.recorder.stop()
+            except Exception:
+                logger.warning("recording_cleanup_failed session=%s", generation)
+        self.hotkey_listener.reset_state()
+        self.engine.reset_preview_cache()
+        self.hud.hideHUD()
+        self.update_status_title("")
+        self.update_menu_status()
+        if error:
+            self.sounds.play_cancel()
+        logger.info("session_finished session=%s status=%s elapsed_ms=%.1f", generation,
+                    "error" if error else "event_posted", (time.monotonic() - self.session.started_at) * 1000)
+
+    def _arm_recovery_expiry(self):
+        if self._recovery_timer is not None:
+            self._recovery_timer.invalidate()
+        self._recovery_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            self.recovery.ttl, self, "onRecoveryExpiry:", None, False)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(self._recovery_timer, NSRunLoopCommonModes)
+
+    def onRecoveryExpiry_(self, timer):
+        if timer is not self._recovery_timer:
+            return
+        self.recovery.get()
+        self._recovery_timer = None
         self.update_menu_status()
 
-        # Stop recording and run transcription in dedicated worker executor
-        audio, duration = self.recorder.stop()
+    def onRetryInsertion_(self, sender):
+        text = self.recovery.get()
+        if not text or not self.session.begin():
+            self.sounds.play_cancel()
+            return
+        # Let the menu close before capturing the active target and sending keys.
+        generation = self.session.generation
+        self.session.state = DictationState.INSERTING
+        AppHelper.callLater(0.15, self._insert_result, generation, text)
 
-        def _worker():
-            _set_thread_qos_user_interactive()
-            if duration < self.config.min_duration or len(audio) == 0:
-                logger.info(f"Audio too short ({duration:.2f}s), skipping.")
-                self.sounds.play_cancel()
-                AppHelper.callAfter(self._finishTranscription_, "")
-                return
+    def onCopyLastText_(self, sender):
+        if self.session.busy:
+            return
+        result = self.inserter.copy_text(self.recovery.get(), self.config.conceal_clipboard)
+        if not result:
+            self.session.error = "Не удалось скопировать текст"
+            self.session.state = DictationState.ERROR
+        else:
+            self.session.error = ""
+            self.session.state = DictationState.IDLE
+        self.update_status_title("")
+        self.update_menu_status()
 
-            if not self.engine.is_loaded:
-                logger.info(
-                    "Waiting for model warmup to finish before transcription..."
-                )
-                self.engine.wait_loaded(timeout=15.0)
-
-            t0 = time.time()
-            try:
-                text = self.engine.transcribe(audio)
-                proc_time = time.time() - t0
-                word_count = len(text.split()) if text else 0
-                logger.info(
-                    f"Transcribed speech in {proc_time:.2f}s ({len(text)} chars, {word_count} words). "
-                    "Zero-Persistence: text content is not written to disk logs."
-                )
-
-                if text:
-                    # Insert text under cursor
-                    self.inserter.insert_text(
-                        text,
-                        add_trailing_space=self.config.add_trailing_space,
-                        restore_clipboard=self.config.restore_clipboard,
-                        conceal_clipboard=self.config.conceal_clipboard,
-                        delay=self.config.paste_delay,
-                    )
-                    self.sounds.play_success()
-                    AppHelper.callAfter(self._finishTranscription_, text)
-                else:
-                    self.sounds.play_cancel()
-                    AppHelper.callAfter(self._finishTranscription_, "")
-            except Exception as e:
-                logger.error(f"Transcription error: {e}", exc_info=True)
-                self.sounds.play_cancel()
-                AppHelper.callAfter(self._finishTranscription_, "")
-
-        _WORKER_EXECUTOR.submit(_worker)
+    def onClearLastText_(self, sender):
+        self.recovery.clear()
+        if self._recovery_timer is not None:
+            self._recovery_timer.invalidate()
+            self._recovery_timer = None
+        self.update_menu_status()
 
     def _start_preview_timer(self):
         self._stop_preview_timer()
@@ -772,10 +849,8 @@ class MenuAppController(NSObject):
         if not self.engine.is_loaded or getattr(self, "_is_preview_running", False):
             return
 
-        snapshot = self.recorder.get_stream_snapshot(max_seconds=None)
-        if len(snapshot) < int(0.4 * self.recorder.sample_rate):
+        if self._preview_future is not None and not self._preview_future.done():
             return
-
         self._is_preview_running = True
         session_id = self._preview_session_id
 
@@ -784,21 +859,30 @@ class MenuAppController(NSObject):
                 _set_thread_qos_user_interactive()
                 if not self.recorder.is_recording or session_id != getattr(self, "_preview_session_id", 0):
                     return
-                text = self.engine.transcribe_preview(snapshot)
+                t0 = time.monotonic()
+                offset = self.engine.preview_offset
+                snapshot = self.recorder.get_stream_snapshot_from(offset)
+                if len(snapshot) < int(0.4 * self.recorder.sample_rate):
+                    return
+                text = self.engine.transcribe_preview(
+                    snapshot, offset=offset,
+                    cancelled=lambda: session_id != self._preview_session_id or not self.recorder.is_recording,
+                )
+                logger.debug("preview_done session=%s elapsed_ms=%.1f", session_id, (time.monotonic() - t0) * 1000)
                 if (
                     text
                     and self.recorder.is_recording
                     and session_id == getattr(self, "_preview_session_id", 0)
                 ):
                     AppHelper.callAfter(self._deliver_preview_text, text, session_id)
-            except Exception as e:
-                logger.debug(f"Live preview worker error: {e}")
+            except Exception:
+                logger.debug("preview_worker_failed")
             finally:
                 if session_id == getattr(self, "_preview_session_id", 0):
                     self._is_preview_running = False
 
         try:
-            _PREVIEW_EXECUTOR.submit(_preview_worker)
+            self._preview_future = _PREVIEW_EXECUTOR.submit(_preview_worker)
         except Exception as e:
             logger.debug(f"Failed to submit preview worker: {e}")
             self._is_preview_running = False
@@ -811,44 +895,47 @@ class MenuAppController(NSObject):
         ):
             self.hud.setPreviewText_(text)
 
-    def _finishTranscription_(self, text):
-        self._stop_preview_timer()
-        self.ducker.unduck()
-        self.hud.hideHUD()
-        self.update_status_title("")
-        self.update_menu_status()
-
     def onSelectModel_(self, sender):
+        if self.session.busy or self._model_reloading:
+            return
         new_model = sender.representedObject()
         if new_model == self.config.model_name:
             return
+        self._model_reloading = True
         self.config.model_name = new_model
         self.config.save()
         self.update_status_title(f"⏳ Загрузка {new_model}...")
         self.rebuild_menu()
 
         def _reload():
-            self.engine.load(model_name=new_model)
-            AppHelper.callAfter(self.onModelLoaded_, None)
+            success = self.engine.load(model_name=new_model)
+            AppHelper.callAfter(self.onModelLoaded_ if success else self.onModelError_,
+                                None if success else "Не удалось загрузить модель")
 
         _WORKER_EXECUTOR.submit(_reload)
 
     def onSelectDevice_(self, sender):
+        if self.session.busy or self._model_reloading:
+            return
         new_device = sender.representedObject()
         if new_device == self.config.device:
             return
+        self._model_reloading = True
         self.config.device = new_device
         self.config.save()
         self.update_status_title(f"⏳ Переключение на {new_device}...")
         self.rebuild_menu()
 
         def _reload():
-            self.engine.load(device=new_device)
-            AppHelper.callAfter(self.onModelLoaded_, None)
+            success = self.engine.load(device=new_device)
+            AppHelper.callAfter(self.onModelLoaded_ if success else self.onModelError_,
+                                None if success else "Не удалось переключить устройство")
 
         _WORKER_EXECUTOR.submit(_reload)
 
     def onSelectMode_(self, sender):
+        if self.session.busy:
+            return
         new_mode = sender.representedObject()
         self.config.hotkey_mode = new_mode
         self.config.save()
@@ -856,6 +943,8 @@ class MenuAppController(NSObject):
         self.rebuild_menu()
 
     def onSelectDefaultHotkey_(self, sender):
+        if self.session.busy:
+            return
         if self.config.hotkey == "right_cmd":
             return
         self.config.hotkey = "right_cmd"
@@ -865,6 +954,8 @@ class MenuAppController(NSObject):
         self.rebuild_menu()
 
     def onSelectCustomHotkey_(self, sender):
+        if self.session.busy:
+            return
         if not self.config.custom_hotkey:
             self.onCustomHotkeyDialog_(sender)
             return
@@ -876,6 +967,8 @@ class MenuAppController(NSObject):
         self.rebuild_menu()
 
     def onCustomHotkeyDialog_(self, sender):
+        if self.session.busy:
+            return
         """Opens automatic key recorder window where pressing any key captures it."""
         self._open_key_capture_window()
 
@@ -1113,8 +1206,8 @@ class MenuAppController(NSObject):
             alert.setInformativeText_(
                 "macOS требует разрешение 'Универсальный доступ' (Accessibility) "
                 "для симуляции нажатия Cmd+V и автовставки текста под курсор.\n\n"
-                "Если разрешение не выдано, текст всё равно копируется в буфер обмена, "
-                "и вы можете вставить его вручную нажав Cmd+V."
+                "Если разрешение не выдано, результат сохраняется на пять минут в памяти. "
+                "Выберите «Скопировать последний текст» в меню и вставьте его вручную."
             )
             alert.addButtonWithTitle_("Открыть Настройки macOS")
             alert.addButtonWithTitle_("Позже")
@@ -1124,7 +1217,7 @@ class MenuAppController(NSObject):
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Разрешения в порядке")
             alert.setInformativeText_(
-                "Разрешение 'Универсальный доступ' уже предоставлено. Автовставка работает!"
+                "Разрешение 'Универсальный доступ' предоставлено. Отправка событий ввода доступна."
             )
             alert.addButtonWithTitle_("OK")
             alert.runModal()
@@ -1165,18 +1258,7 @@ class MenuAppController(NSObject):
 
     def execute_complete_uninstallation(self):
         logger.info("Executing complete uninstallation...")
-
-        # 1. Stop background components
-        try:
-            self.ducker.unduck()
-            self._stop_preview_timer()
-            self.hotkey_listener.stop()
-            self.hud.hideHUD()
-            self.recorder.close()
-            _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-            _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        except Exception as e:
-            logger.warning(f"Error stopping components during uninstall: {e}")
+        self._shutdown()
 
         # 2. Determine running bundle path
         bundle = NSBundle.mainBundle()
@@ -1239,13 +1321,7 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
 
     def restart_application(self):
         logger.info("Restarting application...")
-        self.ducker.unduck()
-        self._stop_preview_timer()
-        self.hotkey_listener.stop()
-        self.hud.hideHUD()
-        self.recorder.close()
-        _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        self._shutdown()
         from AppKit import NSURL, NSWorkspace
 
         app_url = NSURL.fileURLWithPath_("/Applications/GigaDictate.app")
@@ -1253,12 +1329,35 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
             NSWorkspace.sharedWorkspace().openURL_(app_url)
         NSApplication.sharedApplication().terminate_(self)
 
-    def onQuitApp_(self, sender):
-        self.ducker.unduck()
-        self._stop_preview_timer()
-        self.hotkey_listener.stop()
-        self.hud.hideHUD()
-        self.recorder.close()
+    def _shutdown(self):
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self.session.invalidate()
+        self._preview_session_id += 1
+        self.recovery.clear()
+        if self._recovery_timer is not None:
+            self._recovery_timer.invalidate()
+            self._recovery_timer = None
+        for name, cleanup in (
+            ("preview", self._stop_preview_timer),
+            ("clipboard", self.inserter.cancel_pending),
+            ("hud", self.hud.close),
+            ("volume", self.ducker.unduck),
+            ("hotkey", self.hotkey_listener.stop),
+            ("microphone", self.recorder.close),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                logger.warning("shutdown_cleanup_failed component=%s", name)
+        self.engine.reset_preview_cache()
         _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+
+    def applicationWillTerminate_(self, notification):
+        self._shutdown()
+
+    def onQuitApp_(self, sender):
+        self._shutdown()
         NSApplication.sharedApplication().terminate_(self)

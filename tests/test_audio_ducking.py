@@ -1,3 +1,5 @@
+import os
+from tests.support import IsolatedTestCase
 import json
 import os
 import tempfile
@@ -9,7 +11,7 @@ from giga_dictate.ducking import AudioDucker
 from giga_dictate.menu_app import MenuAppController
 
 
-class TestAudioDucking(unittest.TestCase):
+class TestAudioDucking(IsolatedTestCase):
     def test_app_config_audio_ducking_defaults(self):
         """AppConfig must default audio_ducking to True and ducking_volume to 0.12."""
         config = AppConfig()
@@ -79,9 +81,13 @@ class TestAudioDucking(unittest.TestCase):
             self.assertFalse(ducker.is_ducked)
             mock_set.assert_called_once_with(0.05)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_ducking_enabled_triggers_duck_and_unduck(self):
         """MenuAppController ducks on start_recording and unducks on stop_and_transcribe."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.config.audio_ducking = True
         controller.config.ducking_volume = 0.12
 
@@ -99,9 +105,13 @@ class TestAudioDucking(unittest.TestCase):
         controller.stop_and_transcribe()
         mock_ducker.unduck.assert_called_once()
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_ducking_disabled_does_not_duck(self):
         """MenuAppController does not duck when audio_ducking config is False."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.config.audio_ducking = False
 
         mock_ducker = MagicMock()
@@ -111,9 +121,13 @@ class TestAudioDucking(unittest.TestCase):
         controller.start_recording()
         mock_ducker.duck.assert_not_called()
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_toggle_audio_ducking(self):
         """Toggling audio ducking in menu flips config and unducks if currently ducked."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.config.audio_ducking = True
 
         mock_ducker = MagicMock()

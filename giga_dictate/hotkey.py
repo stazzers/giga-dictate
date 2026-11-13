@@ -16,6 +16,7 @@ from Quartz import (
     CGEventGetIntegerValueField,
     CGEventTapCreate,
     CGEventTapEnable,
+    kCGEventSourceUserData,
     kCGEventFlagMaskAlternate,
     kCGEventFlagMaskCommand,
     kCGEventFlagMaskControl,
@@ -30,6 +31,8 @@ from Quartz import (
     kCGKeyboardEventKeycode,
     kCGSessionEventTap,
 )
+
+from .events import SYNTHETIC_EVENT_TAG
 
 logger = logging.getLogger("giga_dictate.hotkey")
 
@@ -354,6 +357,10 @@ class HotkeyListener:
 
         return True
 
+    def set_recording(self, active: bool) -> None:
+        """Synchronize manual controls without losing physical key-down tracking."""
+        self._is_active = active
+
     def reset_state(self) -> None:
         """Resets active and key-down states to idle to prevent lockouts on error."""
         self._is_active = False
@@ -364,6 +371,9 @@ class HotkeyListener:
         if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
             if self._tap is not None:
                 CGEventTapEnable(self._tap, True)
+            return event
+
+        if CGEventGetIntegerValueField(event, kCGEventSourceUserData) == SYNTHETIC_EVENT_TAG:
             return event
 
         vk = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
@@ -394,7 +404,7 @@ class HotkeyListener:
 
         # Check if the event matches our target virtual keycode
         if vk == self.target_vk:
-            now = time.time()
+            now = time.monotonic()
             if self.mode == "toggle":
                 if is_down:
                     if not self._is_key_down:

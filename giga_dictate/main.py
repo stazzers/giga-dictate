@@ -36,6 +36,8 @@ logging.basicConfig(
     handlers=handlers,
 )
 logger = logging.getLogger("giga_dictate")
+if os.environ.get("GIGA_DICTATE_DEBUG") == "1":
+    logger.setLevel(logging.DEBUG)
 
 
 _main_controller = None

@@ -1,3 +1,5 @@
+import os
+from tests.support import IsolatedTestCase
 import time
 import unittest
 from unittest.mock import MagicMock
@@ -20,10 +22,11 @@ from giga_dictate.hud import (
 from giga_dictate.menu_app import MenuAppController
 
 
-class TestLiveHUDPreview(unittest.TestCase):
+class TestLiveHUDPreview(IsolatedTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = NSApplication.sharedApplication()
+        if os.environ.get("GIGA_UI_TESTS") == "1":
+            cls.app = NSApplication.sharedApplication()
 
     def test_app_config_live_hud_preview_defaults_and_persistence(self):
         """Verify AppConfig.live_hud_preview default and roundtrip serialization."""
@@ -134,9 +137,11 @@ class TestLiveHUDPreview(unittest.TestCase):
         mock_model.forward.assert_called_once()
         mock_model._decode.assert_called_once()
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_dimensions_and_mode_switching(self):
         """Verify VoiceInputHUD adjusts size, layout and subviews between preview and classic modes."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         self.assertTrue(hud.live_preview_enabled)
 
         # 1. Preview mode layout
@@ -164,9 +169,11 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(hud.panel.frame().size.height, PREVIEW_HEIGHT)
         self.assertFalse(hud.text_label.isHidden())
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_text_updates_and_states(self):
         """Verify text label content across recording, preview updates, and transcribing states."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
 
         # showRecording resets to "..."
@@ -187,6 +194,7 @@ class TestLiveHUDPreview(unittest.TestCase):
         hud.hideHUD()
         self.assertEqual(hud.state, "idle")
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_locate_caret_or_cursor_sizing(self):
         """locate_caret_or_cursor should correctly position both classic and preview sizes under caret."""
         # 1. Real screen coordinates check
@@ -201,9 +209,13 @@ class TestLiveHUDPreview(unittest.TestCase):
         diff_w = (PREVIEW_WIDTH - CLASSIC_WIDTH) / 2.0
         self.assertEqual(diff_w, 109.0)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_live_hud_preview_checkbox(self):
         """Verify menu bar item '[✓] Живой предпросмотр в HUD' presence, state, and toggling."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.config.live_hud_preview = True
         controller.rebuild_menu()
 
@@ -231,9 +243,13 @@ class TestLiveHUDPreview(unittest.TestCase):
         items_on = [item for item in controller.menu.itemArray() if item.title() and "Живой предпросмотр" in item.title()]
         self.assertEqual(items_on[0].state(), 1)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_preview_timer_lifecycle(self):
         """Verify preview timer starts during recording when enabled and stays inactive when disabled."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.engine._is_loaded = True
         controller.engine.transcribe = MagicMock(return_value="тест")
         controller.inserter.insert_text = MagicMock()
@@ -266,9 +282,11 @@ class TestLiveHUDPreview(unittest.TestCase):
         controller.stop_and_transcribe()
         self.assertIsNone(controller._preview_timer)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_set_preview_text_rejected_when_not_recording(self):
         """setPreviewText_ must strictly reject updates when state is transcribing or idle."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
 
         # 1. In idle state
@@ -288,9 +306,11 @@ class TestLiveHUDPreview(unittest.TestCase):
         hud.setPreviewText_("распознанные слова")
         self.assertEqual(hud.text_label.stringValue(), "распознанные слова")
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_fade_timer_cancelled_on_show_recording_and_safe_on_fade_done(self):
         """showRecording must cancel pending fade timer, and _onFadeDone_ must not stop active recording timer."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
 
         # Simulate hideHUD running and arming _fade_timer
@@ -310,9 +330,13 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(hud.timer, initial_timer)
         self.assertTrue(hud._is_visible)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_session_id_invalidates_stale_preview_delivery(self):
         """_deliver_preview_text must discard text from prior or cancelled recording sessions."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.hud = VoiceInputHUD.alloc().init()
         controller.hud.setLivePreviewEnabled_(True)
         controller.recorder._recording = True
@@ -409,9 +433,13 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(passed_wav.shape, torch.Size([1, 16000]))
         self.assertEqual(passed_wav.dtype, torch.float32)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_toggle_live_hud_preview_while_recording(self):
         """Toggling live_hud_preview while actively recording starts or stops preview timer immediately."""
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         controller.recorder._recording = True
         controller.hud.state = "recording"
         controller.config.live_hud_preview = True
@@ -433,15 +461,18 @@ class TestLiveHUDPreview(unittest.TestCase):
         controller._stop_preview_timer()
         controller.recorder._recording = False
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_set_preview_text_whitespace_normalization(self):
         """setPreviewText_ normalizes newlines and consecutive whitespace into a single clean line."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
         hud.state = "recording"
 
         hud.setPreviewText_("первое\nвторое   третье\tчетвертое")
         self.assertEqual(hud.text_label.stringValue(), "первое второе третье четвертое")
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_waveform_adaptive_max_height(self):
         """VoiceWaveformView adapts maximum bar height to view frame, preventing top/bottom clipping."""
         from AppKit import NSPoint, NSRect, NSSize
@@ -536,6 +567,7 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(len(snap), 1600)
         recorder.close()
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_waveform_view_draw_rect_execution(self):
         """VoiceWaveformView.drawRect_ executes without errors and clears background."""
         from AppKit import NSBitmapImageRep, NSPoint, NSRect, NSSize
@@ -549,6 +581,7 @@ class TestLiveHUDPreview(unittest.TestCase):
         wave.cacheDisplayInRect_toBitmapImageRep_(wave.bounds(), rep)
         self.assertIsNotNone(rep)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_glass_style_and_opacity_persistence(self):
         """Verify glass style configuration and opacity levels (glass, balanced, matte)."""
         config = AppConfig()
@@ -556,6 +589,7 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertAlmostEqual(config.hud_glass_alpha, 0.25)
 
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setGlassStyle_("matte")
         self.assertEqual(hud.container_view.glass_style, "matte")
         self.assertAlmostEqual(hud.container_view.glass_opacity, 0.85)
@@ -568,9 +602,11 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(hud.container_view.glass_style, "glass")
         self.assertAlmostEqual(hud.container_view.glass_opacity, 0.22)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_dynamic_expanding_width_and_height(self):
         """Verify HUD expands wider and taller when displaying full multi-line speech phrases."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
         hud.showRecording()
 
@@ -590,9 +626,11 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertGreater(expanded_frame.size.height, PREVIEW_HEIGHT)
         self.assertEqual(hud.text_label.stringValue(), long_phrase)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_mini_waveform_in_bottom_right(self):
         """Verify mini waveform indicator sits in bottom right of expanding preview HUD."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
         hud.showRecording()
 
@@ -668,14 +706,16 @@ class TestLiveHUDPreview(unittest.TestCase):
         self.assertEqual(snap_all[-1], 2.0)
         recorder.close()
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_hud_anchor_caching_and_measurement_memoization(self):
         """VoiceInputHUD caches caret anchor and memoizes string measurements during preview expansions."""
         hud = VoiceInputHUD.alloc().init()
+        self.addCleanup(hud.close)
         hud.setLivePreviewEnabled_(True)
 
         self.assertIsNone(hud._anchor_center_x)
         self.assertIsNone(hud._anchor_top_y)
-        self.assertIn("...", hud._measure_cache)
+        self.assertTrue(any(key[0] == "..." for key in hud._measure_cache))
 
         hud.showRecording()
         self.assertIsNotNone(hud._anchor_center_x)
@@ -685,18 +725,20 @@ class TestLiveHUDPreview(unittest.TestCase):
         # Preview update: anchor center should remain stable
         hud.setPreviewText_("Короткий текст")
         self.assertEqual(hud._anchor_center_x, initial_anchor_x)
-        self.assertIn("Короткий текст", hud._measure_cache)
+        self.assertTrue(any(key[0] == "Короткий текст" for key in hud._measure_cache))
 
         # Calling again with identical text reuses measurement cache
-        cached_dims = hud._measure_cache["Короткий текст"]
+        cache_key = next(key for key in hud._measure_cache if key[0] == "Короткий текст")
+        cached_dims = hud._measure_cache[cache_key]
         hud.setPreviewText_("Короткий текст")
-        self.assertEqual(hud._measure_cache["Короткий текст"], cached_dims)
+        self.assertEqual(hud._measure_cache[cache_key], cached_dims)
 
         # Hiding HUD clears anchor
         hud.hideHUD()
         self.assertIsNone(hud._anchor_center_x)
         self.assertIsNone(hud._anchor_top_y)
 
+    @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
     def test_menu_app_darwin_qos_elevation(self):
         """_set_thread_qos_user_interactive safely sets Darwin QOS_CLASS_USER_INTERACTIVE."""
         from giga_dictate.menu_app import _set_thread_qos_user_interactive

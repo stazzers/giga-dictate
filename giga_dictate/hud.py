@@ -1,5 +1,7 @@
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import objc
 from AppKit import (
@@ -31,6 +33,12 @@ from AppKit import (
     NSVisualEffectMaterialHUDWindow,
     NSVisualEffectStateActive,
     NSVisualEffectView,
+    NSApplicationDidChangeScreenParametersNotification,
+    NSStatusWindowLevel,
+    NSWindowStyleMaskNonactivatingPanel,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+    NSWorkspaceActiveSpaceDidChangeNotification,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
     NSWindowStyleMaskBorderless,
@@ -40,6 +48,7 @@ from ApplicationServices import (
     AXUIElementCopyAttributeValue,
     AXUIElementCopyParameterizedAttributeValue,
     AXUIElementCreateApplication,
+    AXUIElementSetMessagingTimeout,
     AXValueGetValue,
     kAXBoundsForRangeParameterizedAttribute,
     kAXFocusedUIElementAttribute,
@@ -50,13 +59,15 @@ from ApplicationServices import (
     kAXValueCGRectType,
     kAXValueCGSizeType,
 )
-from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import NSObject, NSNotificationCenter, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from PyObjCTools import AppHelper
 
 logger = logging.getLogger("giga_dictate.hud")
 
 # Borderless, non-activating floating panel (never steals focus)
-STYLE_MASK = NSWindowStyleMaskBorderless | (1 << 7)
-FLOATING_LEVEL = 1000  # Floating above windows
+STYLE_MASK = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+FLOATING_LEVEL = NSStatusWindowLevel
+_CARET_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GigaCaret")
 
 CLASSIC_WIDTH = 72.0
 CLASSIC_HEIGHT = 52.0
@@ -76,6 +87,7 @@ def locate_caret_or_cursor(
     hud_h: float = 52.0,
     screens: list | None = None,
     target_pt: NSPoint | None = None,
+    *, use_accessibility=True, front_pid=None, mouse_point=None,
 ) -> NSPoint:
     """
     Finds screen coordinates (in Cocoa coordinate space) for:
@@ -85,8 +97,8 @@ def locate_caret_or_cursor(
     4. Fallback: Bottom-center of the screen
     Accurately resolves multi-screen geometries and avoids cross-display clamping.
     """
-    screen = NSScreen.mainScreen()
     screens_list = screens if screens is not None else NSScreen.screens()
+    screen = screens_list[0] if screens is not None and screens_list else (NSScreen.mainScreen() if screens is None else None)
     primary_h = screens_list[0].frame().size.height if screens_list else 900.0
     active_screen_frame = (
         screens_list[0].visibleFrame()
@@ -100,16 +112,19 @@ def locate_caret_or_cursor(
     caret_y = None
     caret_h = None
 
-    if target_pt is None:
+    if target_pt is None and use_accessibility:
         try:
-            front_app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if front_app is not None:
-                pid = front_app.processIdentifier()
-                app_ax = AXUIElementCreateApplication(pid)
+            if front_pid is None:
+                front_app = NSWorkspace.sharedWorkspace().frontmostApplication()
+                front_pid = front_app.processIdentifier() if front_app else None
+            if front_pid is not None:
+                app_ax = AXUIElementCreateApplication(front_pid)
+                AXUIElementSetMessagingTimeout(app_ax, 0.08)
                 err, focused = AXUIElementCopyAttributeValue(
                     app_ax, kAXFocusedUIElementAttribute, None
                 )
                 if err == 0 and focused is not None:
+                    AXUIElementSetMessagingTimeout(focused, 0.08)
                     # 1. Exact blinking text cursor (caret) range bounds
                     err_r, sel_r = AXUIElementCopyAttributeValue(
                         focused, kAXSelectedTextRangeAttribute, None
@@ -158,7 +173,8 @@ def locate_caret_or_cursor(
 
     # Determine matching screen for the target coordinates
     if screens_list and target_x is not None and target_y is not None:
-        test_pt = NSPoint(target_x + hud_w / 2.0, target_y + hud_h / 2.0)
+        test_pt = NSPoint(target_x + hud_w / 2.0,
+                          caret_y + caret_h / 2.0 if caret_y is not None else target_y + hud_h / 2.0)
         for s in screens_list:
             if NSPointInRect(test_pt, s.frame()):
                 target_screen_frame = s.visibleFrame()
@@ -172,7 +188,7 @@ def locate_caret_or_cursor(
     # 3. Fallback: Mouse cursor location
     if target_x is None or target_y is None:
         try:
-            m_pt = NSEvent.mouseLocation()
+            m_pt = mouse_point if mouse_point is not None else NSEvent.mouseLocation()
             mouse_screen_frame = active_screen_frame
             if screens_list:
                 for s in screens_list:
@@ -510,6 +526,26 @@ class LiveHUDContainerView(NSView):
         pass
 
 
+@dataclass(frozen=True)
+class _ScreenGeometry:
+    full: object
+    visible: object
+
+    def frame(self):
+        return self.full
+
+    def visibleFrame(self):
+        return self.visible
+
+
+class NonactivatingHUDPanel(NSPanel):
+    def canBecomeKeyWindow(self):
+        return False
+
+    def canBecomeMainWindow(self):
+        return False
+
+
 class VoiceInputHUD(NSObject):
     """
     Floating voice animation HUD badge.
@@ -541,8 +577,15 @@ class VoiceInputHUD(NSObject):
         self._anchor_center_x = None
         self._anchor_top_y = None
         self._measure_cache = {}
+        self._generation = 0
+        self._caret_future = None
+        self._closed = False
 
         self._create_panel()
+        NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+            self, "onWorkspaceChange:", NSWorkspaceActiveSpaceDidChangeNotification, None)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self, "onWorkspaceChange:", NSApplicationDidChangeScreenParametersNotification, None)
         return self
 
     def _create_panel(self):
@@ -550,7 +593,7 @@ class VoiceInputHUD(NSObject):
         height = PREVIEW_HEIGHT if self.live_preview_enabled else CLASSIC_HEIGHT
 
         rect = NSRect(NSPoint(100, 100), NSSize(width, height))
-        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        self.panel = NonactivatingHUDPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             rect, STYLE_MASK, NSBackingStoreBuffered, False
         )
         self.panel.setFloatingPanel_(True)
@@ -565,6 +608,8 @@ class VoiceInputHUD(NSObject):
         self.panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorIgnoresCycle
         )
 
         self.container_view = LiveHUDContainerView.alloc().initWithFrame_(
@@ -615,20 +660,27 @@ class VoiceInputHUD(NSObject):
             display_text = self._current_text or "..."
             pad_left = 14.0
             pad_right = 38.0  # Room for bottom-right mini-waveform (26px + 12px margin)
-            max_w = PREVIEW_MAX_WIDTH
+            mouse = NSEvent.mouseLocation()
+            anchor = NSPoint(self._anchor_center_x, self._anchor_top_y) if self._anchor_center_x is not None else mouse
+            screen = next((screen for screen in NSScreen.screens() if NSPointInRect(anchor, screen.frame())), NSScreen.mainScreen())
+            visible = screen.visibleFrame() if screen else NSRect(NSPoint(0, 0), NSSize(1440, 900))
+            max_w = max(80.0, min(PREVIEW_MAX_WIDTH, visible.size.width - 16.0))
+            max_h = max(30.0, min(160.0, visible.size.height - 16.0))
             base_h = PREVIEW_HEIGHT
 
-            if display_text in self._measure_cache:
-                w, h, text_h = self._measure_cache[display_text]
+            measure_key = (display_text, max_w, max_h)
+            if measure_key in self._measure_cache:
+                w, h, text_h, rendered = self._measure_cache[measure_key]
+                self.text_label.setStringValue_(rendered)
             else:
                 ns_str = NSString.stringWithString_(display_text)
                 attrs = {NSFontAttributeName: self.text_font}
                 single_sz = ns_str.sizeWithAttributes_(attrs)
 
                 if display_text == "..." or (
-                    single_sz.width + pad_left + pad_right <= PREVIEW_WIDTH
+                    single_sz.width + pad_left + pad_right <= min(PREVIEW_WIDTH, max_w)
                 ):
-                    w = PREVIEW_WIDTH
+                    w = min(PREVIEW_WIDTH, max_w)
                     h = base_h
                     text_h = math.ceil(single_sz.height)
                 elif single_sz.width + pad_left + pad_right <= max_w:
@@ -645,12 +697,21 @@ class VoiceInputHUD(NSObject):
                     rect = ns_str.boundingRectWithSize_options_attributes_context_(
                         NSSize(avail_w, 1200.0), options, attrs, None
                     )
-                    text_h = math.ceil(rect.size.height)
-                    h = max(base_h, text_h + 20.0)
+                    # Keep the newest words visible instead of letting the panel
+                    # grow beyond the display or clipping the start of a tall label.
+                    while rect.size.height > max_h - 20.0 and len(display_text) > 1:
+                        display_text = (display_text.split(" ", 1)[1] if " " in display_text
+                                        else display_text[max(1, len(display_text) // 8):])
+                        ns_str = NSString.stringWithString_("… " + display_text)
+                        rect = ns_str.boundingRectWithSize_options_attributes_context_(
+                            NSSize(avail_w, 1200.0), options, attrs, None)
+                    self.text_label.setStringValue_(str(ns_str))
+                    text_h = min(math.ceil(rect.size.height), max_h - 20.0)
+                    h = min(max_h, max(base_h, text_h + 20.0))
 
                 if len(self._measure_cache) > 128:
                     self._measure_cache.clear()
-                self._measure_cache[display_text] = (w, h, text_h)
+                self._measure_cache[measure_key] = (w, h, text_h, str(ns_str))
 
             if self.container_view is not None:
                 self.container_view.setLivePreviewEnabled_(True)
@@ -715,8 +776,8 @@ class VoiceInputHUD(NSObject):
                         w, h, target_pt=NSPoint(target_x, target_y)
                     )
                 else:
-                    # Query Accessibility IPC once upon opening
-                    new_pt = locate_caret_or_cursor(w, h)
+                    # Immediate pointer fallback; AX refinement happens on a worker
+                    new_pt = locate_caret_or_cursor(w, h, use_accessibility=False)
                     self._anchor_center_x = new_pt.x + (w / 2.0)
                     self._anchor_top_y = new_pt.y + h
                 self.panel.setFrame_display_(NSRect(new_pt, NSSize(w, h)), True)
@@ -743,6 +804,7 @@ class VoiceInputHUD(NSObject):
         if self.state != "recording":
             return
         clean = " ".join(text.split()) if text else ""
+        clean = ("… " + clean[-600:]) if len(clean) > 600 else clean
         self._current_text = clean if clean else "..."
         if clean:
             self.text_label.setStringValue_(clean)
@@ -766,6 +828,7 @@ class VoiceInputHUD(NSObject):
                 logger.debug(f"Fade timer invalidation error: {e}")
             self._fade_timer = None
 
+        self._generation += 1
         self._anchor_center_x = None
         self._anchor_top_y = None
         self.state = "recording"
@@ -781,6 +844,7 @@ class VoiceInputHUD(NSObject):
         self.panel.orderFrontRegardless()
         self.panel.animator().setAlphaValue_(1.0)
         self._start_timer()
+        self._request_caret()
 
     def showTranscribing(self):
         """Switches HUD to transcribing state."""
@@ -799,8 +863,11 @@ class VoiceInputHUD(NSObject):
         """Smoothly fades out and closes HUD."""
         if not self._is_visible:
             return
+        self._generation += 1
         self._is_visible = False
         self.state = "idle"
+        self._current_text = ""
+        self._measure_cache.clear()
         self._anchor_center_x = None
         self._anchor_top_y = None
         # Stop animation timer immediately to save CPU; AppKit animator handles window fade-out via GPU
@@ -816,7 +883,7 @@ class VoiceInputHUD(NSObject):
 
         self._fade_timer = (
             NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-                0.18, self, "_onFadeDone:", None, False
+                0.18, self, "_onFadeDone:", self._generation, False
             )
         )
         NSRunLoop.mainRunLoop().addTimer_forMode_(
@@ -824,6 +891,10 @@ class VoiceInputHUD(NSObject):
         )
 
     def _onFadeDone_(self, timer):
+        if timer is None or timer is not self._fade_timer:
+            return
+        if timer.userInfo() != self._generation:
+            return
         self._fade_timer = None
         self._anchor_center_x = None
         self._anchor_top_y = None
@@ -834,6 +905,66 @@ class VoiceInputHUD(NSObject):
             self.panel.orderOut_(None)
             if self.text_label is not None:
                 self.text_label.setStringValue_("")
+
+    def onWorkspaceChange_(self, notification):
+        if self._closed or not self._is_visible:
+            return
+        self._generation += 1
+        self._anchor_center_x = None
+        self._anchor_top_y = None
+        self._measure_cache.clear()
+        self._update_layout()
+        self.panel.setAlphaValue_(1.0)
+        self.panel.orderFrontRegardless()
+        self._request_caret()
+        logger.info("hud_represented generation=%s visible=%s alpha=%.1f",
+                    self._generation, self.panel.isVisible(), self.panel.alphaValue())
+
+    def _request_caret(self):
+        if self._closed or not self._is_visible:
+            return
+        if self._caret_future is not None and not self._caret_future.done():
+            # Coalesce rapid Space transitions, never queue stale AX requests.
+            return
+        generation = self._generation
+        screens = [_ScreenGeometry(s.frame(), s.visibleFrame()) for s in NSScreen.screens()]
+        mouse = NSEvent.mouseLocation()
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        pid = int(app.processIdentifier()) if app else None
+        width, height = self.panel.frame().size
+        def query():
+            try:
+                point = locate_caret_or_cursor(width, height, screens=screens,
+                                               front_pid=pid, mouse_point=mouse,
+                                               use_accessibility=pid is not None)
+                AppHelper.callAfter(self._deliver_caret, generation, pid, point, width, height)
+            except Exception:
+                logger.debug("caret_query_failed generation=%s", generation)
+        self._caret_future = _CARET_EXECUTOR.submit(query)
+
+    def _deliver_caret(self, generation, pid, point, width, height):
+        if self._closed or not self._is_visible:
+            return
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        current_pid = int(app.processIdentifier()) if app else None
+        if generation != self._generation or pid != current_pid:
+            # Old worker is done by the time this main-loop callback executes.
+            AppHelper.callLater(0.05, self._request_caret)
+            return
+        self._anchor_center_x = point.x + width / 2.0
+        self._anchor_top_y = point.y + height
+        self._update_layout()
+
+    def close(self):
+        self._closed = True
+        self.hideHUD()
+        if self._fade_timer is not None:
+            self._fade_timer.invalidate()
+            self._fade_timer = None
+        self._stop_timer()
+        self.panel.orderOut_(None)
+        NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(self)
+        NSNotificationCenter.defaultCenter().removeObserver_(self)
 
     def _start_timer(self):
         self._stop_timer()

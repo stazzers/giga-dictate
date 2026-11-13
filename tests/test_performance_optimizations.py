@@ -1,10 +1,11 @@
+from tests.support import IsolatedTestCase
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
 import numpy as np
-from AppKit import NSPasteboard, NSStringPboardType
+from AppKit import NSPasteboardTypeString
 
 from giga_dictate.audio import AudioRecorder, split_audio_into_chunks
 from giga_dictate.config import get_default_device
@@ -13,7 +14,7 @@ from giga_dictate.inserter import TextInserter
 from giga_dictate.sounds import SoundManager
 
 
-class TestPerformanceOptimizations(unittest.TestCase):
+class TestPerformanceOptimizations(IsolatedTestCase):
     def test_lazy_config_device_does_not_require_torch(self):
         """get_default_device should return 'mps' on Apple Silicon macOS without importing torch."""
         dev = get_default_device()
@@ -98,12 +99,12 @@ class TestPerformanceOptimizations(unittest.TestCase):
         self.assertEqual(parse_hotkey("/"), 44)
         self.assertEqual(parse_hotkey("space"), 49)
 
-    def test_text_inserter_pooled_restoration(self):
-        """Ensure clipboard restoration reuses pooled worker and restores text."""
-        inserter = TextInserter()
-        pb = NSPasteboard.generalPasteboard()
+    def test_text_inserter_scheduled_restoration(self):
+        """Clipboard cleanup restores text without creating worker threads."""
+        inserter = TextInserter(clock=lambda: self.scheduler.now)
+        pb = self.pasteboard
         pb.clearContents()
-        pb.setString_forType_("BASELINE_CLIPBOARD", NSStringPboardType)
+        pb.setString_forType_("BASELINE_CLIPBOARD", NSPasteboardTypeString)
 
         threads_before = threading.active_count()
         with (
@@ -111,9 +112,9 @@ class TestPerformanceOptimizations(unittest.TestCase):
             patch("giga_dictate.inserter.CGEventPost"),
         ):
             inserter.insert_text("OPTIMIZED_SPEECH", add_trailing_space=False, restore_clipboard=True)
-            time.sleep(0.55)
+            self.scheduler.run_all()
 
-        current = pb.stringForType_(NSStringPboardType)
+        current = pb.stringForType_(NSPasteboardTypeString)
         self.assertEqual(current, "BASELINE_CLIPBOARD")
         # Ensure pooled worker doesn't spawn unbounded threads
         threads_after = threading.active_count()

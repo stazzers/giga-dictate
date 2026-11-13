@@ -1,3 +1,5 @@
+import os
+from tests.support import IsolatedTestCase
 import unittest
 
 from AppKit import NSApplication
@@ -5,13 +7,17 @@ from AppKit import NSApplication
 from giga_dictate.menu_app import MenuAppController
 
 
-class TestMenuAppUI(unittest.TestCase):
+@unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native UI tests require GIGA_UI_TESTS=1")
+class TestMenuAppUI(IsolatedTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = NSApplication.sharedApplication()
 
     def test_pure_menubar_mode(self):
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         self.assertIsNone(getattr(controller, "settings_window", None))
 
         # Build menu and verify pure menubar items
@@ -45,6 +51,9 @@ class TestMenuAppUI(unittest.TestCase):
 
     def test_hotkey_three_line_submenu(self):
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         # 1. Default state: only 2 items (default + change key), NO middle custom key row
         controller.config.hotkey = "right_cmd"
         controller.config.custom_hotkey = None
@@ -91,6 +100,9 @@ class TestMenuAppUI(unittest.TestCase):
 
     def test_recording_menubar_clean_icon_only(self):
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         # Mock status item button
         from AppKit import NSImage, NSStatusBar, NSVariableStatusItemLength
         sb = NSStatusBar.systemStatusBar()
@@ -114,6 +126,9 @@ class TestMenuAppUI(unittest.TestCase):
 
     def test_launch_at_login_toggle(self):
         controller = MenuAppController.alloc().init()
+        self.addCleanup(controller.hud.close)
+        self.addCleanup(controller.recorder.close)
+        self.addCleanup(controller._stop_preview_timer)
         from giga_dictate.config import is_launch_at_login_enabled, set_launch_at_login
 
         try:
