@@ -1,8 +1,8 @@
 """Bounded timeline muxer. WAV PCM16 or native AudioToolbox AAC/M4A."""
 import ctypes as C
 import os
-from pathlib import Path
 import wave
+from pathlib import Path
 
 import numpy as np
 

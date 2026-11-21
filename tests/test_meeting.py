@@ -11,7 +11,7 @@ import wave
 
 import numpy as np
 
-from giga_dictate.diarization import Enrollment, OnlineDiarizer, OwnerProfile, unit
+from giga_dictate.diarization import OnlineDiarizer, unit
 from giga_dictate.meeting_audio import FrameNormalizer
 from giga_dictate.meeting_session import MeetingSession
 from giga_dictate.meeting_types import (AudioFrame, MeetingOptions, MeetingResult,
@@ -37,7 +37,7 @@ class Probability:
 class MeetingContracts(unittest.TestCase):
     def test_export_sort_overlap_and_manual_override(self):
         result = MeetingResult(1, datetime(2026, 11, 13, 14, 30), duration=120)
-        result.speakers = {"a": Speaker("a", "Вы"), "b": Speaker("b", "Собеседник 1")}
+        result.speakers = {"a": Speaker("a", "Спикер 1"), "b": Speaker("b", "Спикер 2")}
         result.turns = [TranscriptTurn(1, 6, 9, "system", "b", "Привет"),
                         TranscriptTurn(2, 3, 8, "microphone", "a", "Как слышно?")]
         result.rename_speaker("b", "Анна")
@@ -45,14 +45,14 @@ class MeetingContracts(unittest.TestCase):
         result.turns[0].speaker_id = "b"  # later automated update cannot erase edit
         text = result.render()
         self.assertLess(text.index("Как слышно"), text.index("Привет"))
-        self.assertIn("[00:00:06] Вы: Привет", text)
+        self.assertIn("[00:00:06] Спикер 1: Привет", text)
         self.assertTrue(text.startswith("# Стенограмма"))
         self.assertFalse(result.render(False).startswith("#"))
         result.clear()
         self.assertEqual(result.turns, [])
 
     def test_options_reject_invalid_mode_or_format(self):
-        for options in (MeetingOptions("bad"), MeetingOptions(audio_path="x.mp3")):
+        for options in (MeetingOptions("bad"), MeetingOptions("enrollment"), MeetingOptions(audio_path="x.mp3")):
             with self.assertRaises(ValueError):
                 options.validate()
 
@@ -136,6 +136,17 @@ class MeetingVAD(unittest.TestCase):
 
 
 class MeetingDiarization(unittest.TestCase):
+    def test_numbered_speakers_have_no_self_role(self):
+        for offset in (0, 1):
+            with self.subTest(offset=offset):
+                diarizer = OnlineDiarizer(lambda pcm: vector(), speaker_offset=offset)
+                first = diarizer.identify(vector())
+                for _ in range(3):
+                    second = diarizer.identify(vector(1))
+                self.assertEqual(diarizer.speakers[first].name, f"Спикер {1 + offset}")
+                self.assertEqual(diarizer.speakers[second].name, f"Спикер {2 + offset}")
+                self.assertNotIn("Вы", [speaker.name for speaker in diarizer.speakers.values()])
+
     def test_change_without_pause(self):
         embed = lambda pcm: vector(0 if pcm.mean() > 0 else 1)
         diarizer = OnlineDiarizer(embed)
@@ -160,50 +171,11 @@ class MeetingDiarization(unittest.TestCase):
         self.assertEqual(diarizer.identify(ambiguous), "unknown")
         self.assertEqual(len(diarizer.centers), 1)
 
-    def test_owner_is_not_updated_from_meeting(self):
-        owner = np.stack([vector()] * 3)
-        diarizer = OnlineDiarizer(lambda pcm: vector(), owner=owner)
-        self.assertEqual(diarizer.identify(vector()), "owner")
-        self.assertTrue(np.array_equal(owner, np.stack([vector()] * 3)))
-        self.assertNotEqual(diarizer.identify(vector(1)), "owner")
 
     def test_invalid_voice_vector(self):
         for value in (np.zeros(192), np.ones(10), np.full(192, np.nan)):
             with self.assertRaises(ValueError):
                 unit(value)
-
-    def test_enrollment_quality(self):
-        enrollment = Enrollment(lambda pcm: vector())
-        with self.assertRaises(ValueError):
-            enrollment.finish()
-        enrollment.feed(SpeechSegment("microphone", 0, 10, np.full(160000, .1, np.float32)))
-        self.assertEqual(enrollment.finish().shape, (5, 192))
-
-    def test_enrollment_rejects_clipping_and_other_speakers(self):
-        enrollment = Enrollment(lambda pcm: vector())
-        enrollment.feed(SpeechSegment("microphone", 0, 10, np.ones(160000, np.float32)))
-        with self.assertRaises(ValueError):
-            enrollment.finish()
-        enrollment.clipped = 0
-        enrollment.vectors = [vector(0), vector(1), vector(2), vector(3)]
-        with self.assertRaises(ValueError):
-            enrollment.finish()
-
-    def test_profile_private_atomic_and_versioned(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            profile = OwnerProfile(Path(tmp) / "private" / "owner.json")
-            self.assertIsNone(profile.load())
-            profile.save([vector()] * 3)
-            self.assertEqual(profile.path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(profile.path.parent.stat().st_mode & 0o777, 0o700)
-            np.testing.assert_array_equal(profile.load(), np.stack([vector()] * 3))
-            data = json.loads(profile.path.read_text())
-            data["model"] = "old-model"
-            profile.path.write_text(json.dumps(data))
-            with self.assertRaises(ValueError):
-                profile.load()
-            profile.delete()
-            self.assertIsNone(profile.load())
 
 
 class MeetingFile(unittest.TestCase):
@@ -285,7 +257,7 @@ class MeetingLifecycle(unittest.TestCase):
             self.captures.append(source)
             return source
 
-        self.manager = MeetingSession(self.engine, Path(self.temporary.name) / "owner.json", notify,
+        self.manager = MeetingSession(self.engine, notify=notify,
             model_finder=lambda: Path(self.temporary.name), microphone_factory=capture,
             system_factory=capture, vad_factory=lambda path: Probability(),
             embedder_factory=lambda path: lambda pcm: vector())
@@ -351,8 +323,9 @@ class MeetingLifecycle(unittest.TestCase):
         self.assertEqual(len(self.captures), 2)
         self.assertEqual(len(result.turns), 2)
         by_source = {turn.source: turn for turn in result.turns}
-        self.assertEqual(by_source["microphone"].speaker_id, "owner")
-        self.assertNotEqual(by_source["system"].speaker_id, "owner")
+        self.assertEqual(by_source["microphone"].speaker_id, "speaker-1")
+        self.assertEqual(by_source["system"].speaker_id, "speaker-2")
+        self.assertNotIn("Вы", [speaker.name for speaker in result.speakers.values()])
         self.assertEqual(by_source["system"].start, by_source["microphone"].start)
 
     def test_no_disk_and_no_network_without_opt_in(self):
@@ -363,6 +336,126 @@ class MeetingLifecycle(unittest.TestCase):
             result = self.finish()
         self.assertTrue(result.turns)
         self.assertEqual(list(Path(self.temporary.name).iterdir()), [])
+
+    def test_room_speakers_start_at_one_and_remain_editable(self):
+        self.start("room")
+        self.feed()
+        result = self.finish()
+        turn = result.turns[0]
+        self.assertEqual(turn.speaker_id, "speaker-1")
+        self.assertEqual(result.speakers[turn.speaker_id].name, "Спикер 1")
+        self.assertNotIn("Вы", [speaker.name for speaker in result.speakers.values()])
+        result.rename_speaker(turn.speaker_id, "Анна")
+        self.assertIn("Анна: Проверка встречи", result.render())
+
+    def test_finalization_recovers_early_uncertain_turns_without_running_asr_twice(self):
+        early = vector() * .4 + vector(2) * np.sqrt(1 - .4 ** 2)
+        later = vector() * .6 + vector(2) * .8
+
+        def embed(pcm):
+            mean = float(pcm.mean())
+            return vector() if mean < .15 else early if mean < .25 else later if mean < .35 else vector(1)
+
+        self.manager.embedder_factory = lambda path: embed
+        silence = np.zeros(12800, np.float32)
+        pcm = np.concatenate([part for level in (.1, .2, .3, .4)
+                              for part in (np.full(40000, level, np.float32), silence)])
+        self.start("room")
+        original = OnlineDiarizer.refine
+        before = []
+
+        def refine(diarizer, turns, evidence):
+            before.extend(turn.speaker_id for turn in turns)
+            return original(diarizer, turns, evidence)
+
+        with patch.object(OnlineDiarizer, "refine", autospec=True, side_effect=refine):
+            self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000, pcm))
+            result = self.finish()
+        self.assertIn("unknown", before)
+        self.assertNotIn("unknown", [turn.speaker_id for turn in result.turns])
+        self.assertEqual({turn.speaker_id for turn in result.turns}, {"speaker-1", "speaker-2"})
+        self.assertTrue(all(turn.speaker_id == "speaker-1" for turn in result.turns if turn.start < 9.5))
+        self.assertEqual(self.engine.transcribe.call_count, len(result.turns))
+        self.assertEqual(result.errors, [])
+        self.assertNotIn("Спикер не определён:", result.render())
+
+    def test_refinement_failure_still_completes_with_partial_transcript(self):
+        self.start("room")
+        with patch.object(OnlineDiarizer, "refine", side_effect=RuntimeError("private input")):
+            self.feed()
+            result = self.finish()
+        self.assertTrue(result.turns)
+        self.assertTrue(any("Не удалось уточнить" in error for error in result.errors))
+        self.assertNotIn("private input", " ".join(result.errors))
+
+    def test_final_pass_registers_new_short_reply_speakers_in_result(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(int(round(float(pcm.mean()) * 10)) - 1)
+        levels = [.1, .2, .3, .1, .3, .2, .3, .1, .3]
+        pcm = np.concatenate([p for i, level in enumerate(levels) for p in
+                              (np.full(48000 if i < 2 else 12800, level, np.float32),
+                               np.zeros(12800, np.float32))])
+        self.start("room")
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000, pcm))
+        result = self.finish()
+        self.assertEqual({t.speaker_id for t in result.turns}, {"speaker-1", "speaker-2", "speaker-3"})
+        self.assertTrue(all(t.speaker_id in result.speakers for t in result.turns))
+        self.assertEqual(self.engine.transcribe.call_count, len(result.turns))
+        self.assertEqual(result.errors, [])
+
+    def test_exact_online_count_includes_fixed_microphone(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
+        self.start("online", speaker_count=3)
+        pcm = np.concatenate([p for level in (.1, -.1, .1, -.1) for p in
+                              (np.full(32000, level, np.float32), np.zeros(12800, np.float32))])
+        self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000, pcm))
+        self.feed("microphone")
+        result = self.finish()
+        self.assertEqual({t.speaker_id for t in result.turns}, {"speaker-1", "speaker-2", "speaker-3"})
+        self.assertEqual(result.errors, [])
+
+    def test_impossible_count_returns_controlled_warning_and_preliminary_text(self):
+        self.start("room", speaker_count=6)
+        self.feed()
+        result = self.finish()
+        self.assertTrue(result.turns)
+        self.assertEqual({t.speaker_id for t in result.turns}, {"speaker-1"})
+        self.assertEqual(set(result.speakers), {"speaker-1"})
+        self.assertTrue(any("Недостаточно независимой речи" in error for error in result.errors))
+
+    def test_one_online_voice_rejects_system_speech_but_retains_it(self):
+        self.start("online", speaker_count=1)
+        self.feed("system")
+        self.feed("microphone")
+        result = self.finish()
+        self.assertEqual(len(result.turns), 2)
+        self.assertTrue(any("системном канале" in error for error in result.errors))
+
+    def test_partial_mutation_by_failed_refiner_is_rolled_back(self):
+        def broken(diarizer, turns, evidence):
+            turns[0].speaker_id = "speaker-999"
+            raise RuntimeError("private model input")
+        self.start("room")
+        with patch.object(OnlineDiarizer, "refine", autospec=True, side_effect=broken):
+            self.feed()
+            result = self.finish()
+        self.assertEqual(result.turns[0].speaker_id, "speaker-1")
+        self.assertNotIn("private model input", str(result.errors))
+
+    def test_remote_first_numbering_never_collides_with_microphone(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
+        self.start("online")
+        pcm = np.concatenate((np.full(48000, .1), np.full(48000, -.1))).astype(np.float32)
+        self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000, pcm))
+        self.feed("microphone")
+        result = self.finish()
+        self.assertEqual({turn.speaker_id for turn in result.turns}, {"speaker-1", "speaker-2", "speaker-3"})
+        self.assertEqual({speaker.name for key, speaker in result.speakers.items() if key != "unknown"},
+                         {"Спикер 1", "Спикер 2", "Спикер 3"})
+
+    def test_retired_mode_cannot_open_capture(self):
+        with self.assertRaises(ValueError):
+            self.manager.start(MeetingOptions("enrollment"))
+        self.assertEqual(self.captures, [])
 
     def test_overflow_is_explicit_and_bounded(self):
         self.start()
@@ -414,14 +507,6 @@ class MeetingLifecycle(unittest.TestCase):
         writer.close.assert_called_once()
         self.assertTrue(self.captures[0].closed.is_set())
 
-    def test_enrollment_saves_vectors_without_transcribing(self):
-        self.start("enrollment")
-        self.feed(seconds=20)
-        result = self.finish()
-        self.assertTrue(result.enrollment_complete)
-        self.assertIsNotNone(self.manager.profile.load())
-        self.engine.transcribe.assert_not_called()
-        self.assertEqual([p.name for p in Path(self.temporary.name).iterdir()], ["owner.json"])
 
     def test_failed_system_start_closes_already_open_microphone(self):
         class FailedSystem(Capture):
@@ -537,6 +622,21 @@ class MeetingRealModels(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GIGA_UI_TESTS") == "1", "Native windows require GIGA_UI_TESTS=1")
 class MeetingNativeUI(unittest.TestCase):
+    def test_voice_count_controls_default_to_auto_and_fit_the_view(self):
+        from giga_dictate.meeting_ui import meeting_options_view
+        view, mode, mic, voices, save = meeting_options_view([(2, "Test microphone")])
+        self.assertEqual(voices.titleOfSelectedItem(), "Автоматически")
+        self.assertEqual(voices.numberOfItems(), 17)
+        voices.selectItemAtIndex_(6)
+        self.assertEqual(voices.titleOfSelectedItem(), "6")
+        self.assertFalse(save.state())
+        for control in view.subviews():
+            frame = control.frame()
+            self.assertGreaterEqual(frame.origin.x, 0)
+            self.assertGreaterEqual(frame.origin.y, 0)
+            self.assertLessEqual(frame.origin.x + frame.size.width, view.frame().size.width)
+            self.assertLessEqual(frame.origin.y + frame.size.height, view.frame().size.height)
+
     def setUp(self):
         import AppKit as AK
         from giga_dictate.menu_app import MenuAppController
@@ -563,8 +663,8 @@ class MeetingNativeUI(unittest.TestCase):
         self.assertFalse(self.ui.hud.canBecomeMainWindow())
         self.ui._hide_hud()
         result = MeetingResult(1, datetime.now(), duration=5)
-        result.speakers = {"owner": Speaker("owner", "Вы"), "speaker-1": Speaker("speaker-1", "Собеседник 1")}
-        result.turns = [TranscriptTurn(1, 1, 3, "system", "speaker-1", "Привет")]
+        result.speakers = {"speaker-1": Speaker("speaker-1", "Спикер 1"), "speaker-2": Speaker("speaker-2", "Спикер 2")}
+        result.turns = [TranscriptTurn(1, 1, 3, "system", "speaker-2", "Привет")]
         self.ui.result = result
         self.ui.onShowResult_(None)
         self.assertIn("Привет", str(self.ui.text.string()))
@@ -575,7 +675,9 @@ class MeetingNativeUI(unittest.TestCase):
         self.ui.speaker_popup.selectItemAtIndex_(0)
         self.ui.turn_field.setStringValue_("1")
         self.ui.onAssign_(None)
-        self.assertIn("Вы: Привет", result.render())
+        self.assertIn("Спикер 1: Привет", result.render())
+        self.assertNotIn("Вы", [self.ui.speaker_popup.itemTitleAtIndex_(i)
+                                  for i in range(self.ui.speaker_popup.numberOfItems())])
         self.ui.exported = True
         self.ui.onClose_(None)
         self.assertIsNone(self.ui.result)
@@ -600,6 +702,13 @@ class MeetingNativeUI(unittest.TestCase):
         result = MeetingResult(1, datetime.now())
         self.ui.deliver({"session_id": 1, "kind": "complete", "result": result, "cancelled": False})
         self.assertIsNone(self.ui.result)
+
+    def test_menu_has_no_voice_profile_controls(self):
+        self.controller.rebuild_menu()
+        titles = [str(item.title()) for item in self.controller.menu.itemArray()]
+        self.assertFalse(any("мой голос" in title.lower() or "профиль" in title.lower() for title in titles))
+        self.assertFalse(hasattr(self.ui, "onEnroll_"))
+        self.assertFalse(hasattr(self.ui, "onDeleteProfile_"))
 
     def test_sleep_only_finishes_active_meeting(self):
         self.ui.session.state = MeetingState.RECORDING

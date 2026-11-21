@@ -1,22 +1,29 @@
 """Native meeting controls. All entry points and event delivery run on AppKit."""
-from pathlib import Path
 import os
 import tempfile
 import threading
+from pathlib import Path
 
-import objc
 import AppKit as AK
-from Foundation import NSObject, NSTimer, NSRunLoop, NSRunLoopCommonModes, NSNotificationCenter
+import objc
+from Foundation import (
+    NSNotificationCenter,
+    NSObject,
+    NSRunLoop,
+    NSRunLoopCommonModes,
+    NSTimer,
+)
 from PyObjCTools import AppHelper
 
+from .hud import NonactivatingHUDPanel
 from .meeting_session import MeetingSession
 from .meeting_types import MeetingOptions, MeetingState, timestamp
-from .hud import NonactivatingHUDPanel
 
 
 def label(text, frame):
     field = AK.NSTextField.labelWithString_(text)
     field.setFrame_(frame)
+    field.setTextColor_(AK.NSColor.whiteColor())
     return field
 
 
@@ -29,15 +36,37 @@ def button(title, action, target, frame):
     return item
 
 
+def meeting_options_view(devices):
+    """Build native controls without querying or opening capture devices."""
+    view = AK.NSView.alloc().initWithFrame_(AK.NSMakeRect(0, 0, 500, 230))
+    mode = AK.NSPopUpButton.alloc().initWithFrame_pullsDown_(AK.NSMakeRect(0, 190, 500, 28), False)
+    mode.addItemsWithTitles_(["Онлайн-созвон — микрофон + звук системы", "Живая встреча — один микрофон"])
+    view.addSubview_(mode)
+    mic = AK.NSPopUpButton.alloc().initWithFrame_pullsDown_(AK.NSMakeRect(0, 150, 500, 28), False)
+    mic.addItemsWithTitles_(["Системный микрофон по умолчанию", *[name for _, name in devices]])
+    view.addSubview_(mic)
+    view.addSubview_(label("Количество голосов:", AK.NSMakeRect(0, 110, 175, 25)))
+    voices = AK.NSPopUpButton.alloc().initWithFrame_pullsDown_(AK.NSMakeRect(180, 110, 320, 28), False)
+    voices.addItemsWithTitles_(["Автоматически", *[str(i) for i in range(1, 17)]])
+    view.addSubview_(voices)
+    view.addSubview_(label("Точное число, включая вас и синтезированные голоса. В комнате — до 15.",
+                          AK.NSMakeRect(0, 75, 500, 25)))
+    save = AK.NSButton.checkboxWithTitle_target_action_("Сохранять аудио в .m4a / .wav", None, None)
+    save.setFrame_(AK.NSMakeRect(0, 35, 500, 28))
+    view.addSubview_(save)
+    view.addSubview_(label("Без сохранения аудио остаётся только в ограниченном буфере RAM.", AK.NSMakeRect(0, 0, 500, 25)))
+    return view, mode, mic, voices, save
+
+
 class MeetingUI(NSObject):
     def initWithController_(self, controller):
         self = objc.super(MeetingUI, self).init()
         if self is None:
             return None
         self.controller = controller
-        from .config import CONFIG_DIR
-        self.session = MeetingSession(controller.engine, Path(CONFIG_DIR) / "owner_voice_profile.json",
+        self.session = MeetingSession(controller.engine,
             notify=lambda event: AppHelper.callAfter(self.deliver, event))
+        self.session.prepare_capture = controller.prepare_meeting_audio
         self.window = self.hud = self.timer = None
         self.result = None
         self.exported = False
@@ -66,12 +95,12 @@ class MeetingUI(NSObject):
 
     @objc.python_method
     def available(self):
-        if self.busy or self.controller.session.busy or self.controller._model_reloading:
+        if self.busy or self.controller.session.busy or self.controller._model_reloading or self.controller.audio_busy:
             return False
         if not self.controller.engine.is_loaded:
             self.alert("Модель ещё не готова", "Дождитесь загрузки GigaAM.")
             return False
-        if self.result is None and self.session.result is not None and self.session.options.mode != "enrollment":
+        if self.result is None and self.session.result is not None:
             self.result = self.session.result
             self.exported = False
         if self.result is not None:
@@ -86,6 +115,7 @@ class MeetingUI(NSObject):
         if not self.available():
             return
         import sounddevice as sd
+
         from .meeting_models import find_models
         try:
             find_models()
@@ -96,25 +126,22 @@ class MeetingUI(NSObject):
         alert = AK.NSAlert.alloc().init()
         alert.setMessageText_("Новая встреча")
         alert.setInformativeText_("Созвон захватывает весь системный звук. Используйте наушники: через динамики возможно эхо и дублирование реплик.")
-        view = AK.NSView.alloc().initWithFrame_(AK.NSMakeRect(0, 0, 500, 160))
-        mode = AK.NSPopUpButton.alloc().initWithFrame_pullsDown_(AK.NSMakeRect(0, 120, 500, 28), False)
-        mode.addItemsWithTitles_(["Онлайн-созвон — микрофон + звук системы", "Живая встреча — один микрофон"])
-        view.addSubview_(mode)
-        mic = AK.NSPopUpButton.alloc().initWithFrame_pullsDown_(AK.NSMakeRect(0, 75, 500, 28), False)
-        mic.addItemsWithTitles_(["Системный микрофон по умолчанию", *[name for _, name in devices]])
-        view.addSubview_(mic)
-        save = AK.NSButton.checkboxWithTitle_target_action_("Сохранять аудио в .m4a / .wav", None, None)
-        save.setFrame_(AK.NSMakeRect(0, 35, 500, 28))
-        view.addSubview_(save)
-        view.addSubview_(label("Без сохранения аудио остаётся только в ограниченном буфере RAM.", AK.NSMakeRect(0, 0, 500, 25)))
+        view, mode, mic, voices, save = meeting_options_view(devices)
         alert.setAccessoryView_(view)
         alert.addButtonWithTitle_("Начать")
         alert.addButtonWithTitle_("Отмена")
         if alert.runModal() != AK.NSAlertFirstButtonReturn:
             return
         online = mode.indexOfSelectedItem() == 0
+        speaker_count = voices.indexOfSelectedItem() or None
+        if not online and speaker_count == 16:
+            self.alert("Количество голосов", "Для живой встречи выберите от 1 до 15 голосов или автоматический режим.")
+            return
         if online:
-            from Quartz import CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess
+            from Quartz import (
+                CGPreflightScreenCaptureAccess,
+                CGRequestScreenCaptureAccess,
+            )
             if not CGPreflightScreenCaptureAccess():
                 CGRequestScreenCaptureAccess()
                 if not CGPreflightScreenCaptureAccess():
@@ -133,8 +160,7 @@ class MeetingUI(NSObject):
                 return
         index = mic.indexOfSelectedItem()
         device = devices[index - 1][0] if index else None
-        self.controller.recorder.close()
-        self.session.start(MeetingOptions("online" if online else "room", device, path))
+        self.session.start(MeetingOptions("online" if online else "room", device, path, speaker_count))
         self.controller.hotkey_listener.reset_state()
         self.controller.rebuild_menu()
 
@@ -176,25 +202,6 @@ class MeetingUI(NSObject):
         self.alert("Модели встреч", "Не удалось подготовить модели. Проверьте интернет и зависимости; инструкция — docs/MEETING_MODE.md."
                    if error else "Модели готовы. Во время встреч сеть не используется.")
 
-    def onEnroll_(self, sender):
-        if not self.available():
-            return
-        alert = AK.NSAlert.alloc().init()
-        alert.setMessageText_("Запись моего голоса — 20 секунд")
-        alert.setInformativeText_("В тихой комнате говорите обычным голосом. Например, расскажите о планах на неделю. Приложение сохранит только голосовые векторы; запись заменит предыдущий профиль.")
-        alert.addButtonWithTitle_("Записать")
-        alert.addButtonWithTitle_("Отмена")
-        if alert.runModal() == AK.NSAlertFirstButtonReturn:
-            self.controller.recorder.close()
-            self.session.start(MeetingOptions("enrollment", self.controller.config.audio_device))
-
-    def onDeleteProfile_(self, sender):
-        if not self.busy:
-            try:
-                self.session.profile.delete()
-                self.alert("Профиль удалён", "Для комнатного режима будет использоваться обычная нумерация спикеров.")
-            except OSError:
-                self.alert("Не удалось удалить профиль", "Проверьте права на каталог конфигурации приложения.")
 
     def onSleep_(self, notification):
         if self.session.busy:
@@ -221,16 +228,10 @@ class MeetingUI(NSObject):
             if event["cancelled"]:
                 return
             result = event["result"]
-            if self.session.options.mode == "enrollment":
-                self.alert("Голосовой профиль", "Профиль сохранён" if result.enrollment_complete else
-                           "\n".join(result.errors or ["Запись профиля не завершена"]))
-                result.clear()
-                self.session.result = None
-            else:
-                self.result = result
-                self.exported = False
-                self.onShowResult_(None)
-                self.controller.rebuild_menu()
+            self.result = result
+            self.exported = False
+            self.onShowResult_(None)
+            self.controller.rebuild_menu()
 
     @objc.python_method
     def _show_hud(self):
@@ -240,11 +241,21 @@ class MeetingUI(NSObject):
                 AK.NSWindowStyleMaskNonactivatingPanel, AK.NSBackingStoreBuffered, False)
             self.hud.setReleasedWhenClosed_(False)
             self.hud.setLevel_(AK.NSStatusWindowLevel)
+            self.hud.setOpaque_(False)
+            self.hud.setBackgroundColor_(AK.NSColor.clearColor())
+            self.hud.setHasShadow_(True)
             self.hud.setCollectionBehavior_(AK.NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                           AK.NSWindowCollectionBehaviorFullScreenAuxiliary)
-            self.hud_text = label("Подготовка…", AK.NSMakeRect(15, 24, 265, 24))
+                                           AK.NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                           AK.NSWindowCollectionBehaviorIgnoresCycle)
+            from .hud import LiveHUDGlassBackdropView
+            self.hud_backdrop = LiveHUDGlassBackdropView.alloc().initWithFrame_(AK.NSMakeRect(0, 0, 370, 68))
+            self.hud_backdrop.setGlassStyle_("liquid")
+            self.hud.contentView().addSubview_(self.hud_backdrop)
+
+            self.hud_text = label("Подготовка…", AK.NSMakeRect(16, 22, 258, 24))
+            self.hud_text.setTextColor_(AK.NSColor.whiteColor())
             self.hud.contentView().addSubview_(self.hud_text)
-            self.hud.contentView().addSubview_(button("Стоп", "onStop:", self, AK.NSMakeRect(285, 19, 75, 32)))
+            self.hud.contentView().addSubview_(button("Стоп", "onStop:", self, AK.NSMakeRect(280, 18, 76, 32)))
         screen = AK.NSScreen.mainScreen()
         if screen:
             frame = screen.visibleFrame()
@@ -285,16 +296,35 @@ class MeetingUI(NSObject):
             self.window.makeKeyAndOrderFront_(None)
             return
         self.window = AK.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            AK.NSMakeRect(0, 0, 850, 640), AK.NSWindowStyleMaskTitled | AK.NSWindowStyleMaskClosable,
+            AK.NSMakeRect(0, 0, 850, 640),
+            AK.NSWindowStyleMaskTitled
+            | AK.NSWindowStyleMaskClosable
+            | AK.NSWindowStyleMaskFullSizeContentView,
             AK.NSBackingStoreBuffered, False)
         self.window.setReleasedWhenClosed_(False)
         self.window.setTitle_("Стенограмма встречи")
+        self.window.setTitlebarAppearsTransparent_(True)
+        self.window.setMovableByWindowBackground_(True)
+        self.window.setOpaque_(False)
+        self.window.setBackgroundColor_(AK.NSColor.clearColor())
+        self.window.setHasShadow_(True)
         self.window.setDelegate_(self)
+
         content = self.window.contentView()
+        from .hud import LiveHUDGlassBackdropView
+        self.window_backdrop = LiveHUDGlassBackdropView.alloc().initWithFrame_(AK.NSMakeRect(0, 0, 850, 640))
+        self.window_backdrop.setGlassStyle_("liquid")
+        self.window_backdrop.setCornerRadius_(22.0)
+        self.window_backdrop.setAutoresizingMask_(18)  # NSViewWidthSizable | NSViewHeightSizable
+        content.addSubview_(self.window_backdrop)
+
         scroll = AK.NSScrollView.alloc().initWithFrame_(AK.NSMakeRect(15, 180, 820, 445))
         scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
         self.text = AK.NSTextView.alloc().initWithFrame_(AK.NSMakeRect(0, 0, 800, 445))
         self.text.setEditable_(False)
+        self.text.setDrawsBackground_(False)
+        self.text.setTextColor_(AK.NSColor.colorWithCalibratedWhite_alpha_(0.95, 1.0))
         self.text.setFont_(AK.NSFont.systemFontOfSize_(14))
         self.text.setVerticallyResizable_(True)
         self.text.textContainer().setWidthTracksTextView_(True)
@@ -305,10 +335,12 @@ class MeetingUI(NSObject):
         content.addSubview_(self.speaker_popup)
         self.name_field = AK.NSTextField.alloc().initWithFrame_(AK.NSMakeRect(260, 136, 235, 26))
         self.name_field.setPlaceholderString_("Имя спикера")
+        self.name_field.setTextColor_(AK.NSColor.whiteColor())
         content.addSubview_(self.name_field)
         content.addSubview_(button("Переименовать", "onRename:", self, AK.NSMakeRect(505, 133, 155, 32)))
         content.addSubview_(label("Номер реплики:", AK.NSMakeRect(15, 98, 125, 24)))
         self.turn_field = AK.NSTextField.alloc().initWithFrame_(AK.NSMakeRect(145, 98, 70, 26))
+        self.turn_field.setTextColor_(AK.NSColor.whiteColor())
         content.addSubview_(self.turn_field)
         content.addSubview_(button("Назначить выбранного спикера", "onAssign:", self, AK.NSMakeRect(225, 94, 280, 32)))
         for title, action, x, width in [("Копировать", "onCopy:", 15, 140),
@@ -334,7 +366,8 @@ class MeetingUI(NSObject):
         selected = max(0, self.speaker_popup.indexOfSelectedItem())
         self.speaker_popup.removeAllItems()
         self.speaker_popup.addItemsWithTitles_([self.result.speakers[k].name for k in self.speaker_keys])
-        self.speaker_popup.selectItemAtIndex_(selected)
+        if self.speaker_keys:
+            self.speaker_popup.selectItemAtIndex_(min(selected, len(self.speaker_keys) - 1))
 
     def onRename_(self, sender):
         try:
@@ -424,7 +457,7 @@ class MeetingUI(NSObject):
             if alert.runModal() == AK.NSAlertFirstButtonReturn:
                 self.session.stop()
             return False
-        if self.result is None and self.session.result is not None and self.session.options.mode != "enrollment":
+        if self.result is None and self.session.result is not None:
             self.result = self.session.result
             self.exported = False
         if self.result and not self.windowShouldClose_(self.window):

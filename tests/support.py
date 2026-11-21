@@ -4,6 +4,21 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from concurrent.futures import Future
+
+
+class ImmediateAudioExecutor:
+    """Deterministic native IO stub; responsiveness tests use the real executor."""
+    def submit(self, function, *args):
+        future = Future()
+        try:
+            future.set_result(function(*args))
+        except BaseException as error:
+            future.set_exception(error)
+        return future
+
+    def shutdown(self, **kwargs):
+        pass
 
 
 class Scheduler:
@@ -121,6 +136,9 @@ class IsolatedTestCase(unittest.TestCase):
         self.scheduler = Scheduler()
         self.pasteboard = FakePasteboard()
         replacements = {
+            "giga_dictate.menu_app.AudioExecutor": ImmediateAudioExecutor,
+            "giga_dictate.menu_app.ProcessInputStream": FakeStream,
+            "giga_dictate.menu_app._dispatch_audio": lambda callback, *args: callback(*args),
             "giga_dictate.config.CONFIG_DIR": str(root / "config"),
             "giga_dictate.config.CONFIG_PATH": str(root / "config/config.json"),
             "giga_dictate.config.LAUNCH_AGENT_DIR": str(root / "agents"),

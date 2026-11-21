@@ -42,13 +42,13 @@ def prepare_models(destination=None):
     PyTorch before publishing a manifest, so interrupted setup is never ready.
     """
     import importlib.util
-    from importlib.metadata import distribution
     import os
     import shutil
     import sys
     import tempfile
     import types
     import urllib.request
+    from importlib.metadata import distribution
 
     if destination is None:
         try:
@@ -96,9 +96,9 @@ def prepare_models(destination=None):
             spec = importlib.util.spec_from_file_location(package.__name__ + ".DTDNN", work / "DTDNN.py")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            import torch
             import numpy as np
             import onnxruntime as ort
+            import torch
             model = module.CAMPPlus(feat_dim=80, embedding_size=192).eval()
             model.load_state_dict(torch.load(work / "weights.pt", map_location="cpu", weights_only=True))
             generator = torch.Generator().manual_seed(731)

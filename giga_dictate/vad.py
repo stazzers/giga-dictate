@@ -14,6 +14,8 @@ class SileroProbability:
         options.inter_op_num_threads = 1
         self.session = ort.InferenceSession(str(path), options,
                                             providers=["CPUExecutionProvider"])
+        self._sr = np.array(16000, dtype=np.int64)
+        self._x512 = np.empty((1, 576), np.float32)
         self.reset()
 
     def reset(self):
@@ -21,9 +23,15 @@ class SileroProbability:
         self.context = np.zeros((1, 64), np.float32)
 
     def __call__(self, pcm):
-        x = np.concatenate((self.context, pcm.reshape(1, -1)), axis=1)
+        flat = np.asarray(pcm, np.float32).ravel()
+        if len(flat) == 512:
+            self._x512[0, :64] = self.context[0]
+            self._x512[0, 64:] = flat
+            x = self._x512
+        else:
+            x = np.concatenate((self.context, flat.reshape(1, -1)), axis=1)
         output, self.state = self.session.run(None, {
-            "input": x, "state": self.state, "sr": np.array(16000, dtype=np.int64),
+            "input": x, "state": self.state, "sr": self._sr,
         })
         self.context = x[:, -64:].copy()
         return float(output[0, 0])
@@ -40,6 +48,7 @@ class StreamingVAD:
         self.max_blocks = int(max_duration * 16000 / 512)
         self.history = deque(maxlen=int(np.ceil(preroll * 16000 / 512)))
         self.parts = []
+        self.voiced = []
         self.quiet = 0
         self.start = 0.0
         self.pending = np.empty(0, np.float32)
@@ -73,8 +82,10 @@ class StreamingVAD:
                 return []
             self.start = self.history[0][0] if self.history else at
             self.parts = [part for _, part in self.history]
+            self.voiced = [False] * len(self.parts)
             self.history.clear()
         self.parts.append(block)
+        self.voiced.append(speaking)
         self.quiet = 0 if speaking else self.quiet + 1
         if self.quiet >= self.silence_blocks or len(self.parts) >= self.max_blocks:
             return self._emit()
@@ -85,8 +96,11 @@ class StreamingVAD:
             return []
         pcm = np.concatenate(self.parts)
         segment = SpeechSegment(self.source, self.start,
-                                self.start + len(pcm) / 16000, pcm)
+                                self.start + len(pcm) / 16000, pcm,
+                                np.concatenate([np.full(len(part), voiced, bool)
+                                                for part, voiced in zip(self.parts, self.voiced)]))
         self.parts = []
+        self.voiced = []
         self.quiet = 0
         return [segment]
 
@@ -102,6 +116,7 @@ class StreamingVAD:
             elif results:
                 results[-1].pcm = results[-1].pcm[:-(512 - size)] if size < 512 else results[-1].pcm
                 results[-1].end = results[-1].start + len(results[-1].pcm) / 16000
+                results[-1].speech_mask = results[-1].speech_mask[:len(results[-1].pcm)]
         self.pending = np.empty(0, np.float32)
         results.extend(self._emit())
         self.history.clear()

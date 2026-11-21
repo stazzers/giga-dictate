@@ -4,17 +4,32 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
-from AppKit import NSURL, NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSWorkspace
+from AppKit import (
+    NSURL,
+    NSPasteboard,
+    NSPasteboardItem,
+    NSPasteboardTypeString,
+    NSWorkspace,
+)
 from ApplicationServices import (
-    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
+    AXIsProcessTrusted,
+    AXIsProcessTrustedWithOptions,
+    kAXTrustedCheckOptionPrompt,
 )
 from PyObjCTools import AppHelper
 from Quartz import (
-    CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
-    CGEventSetIntegerValueField, CGEventSourceFlagsState,
-    kCGEventFlagMaskAlternate, kCGEventFlagMaskCommand, kCGEventFlagMaskControl,
-    kCGEventFlagMaskShift, kCGEventSourceStateHIDSystemState,
-    kCGEventSourceUserData, kCGHIDEventTap,
+    CGEventCreateKeyboardEvent,
+    CGEventPost,
+    CGEventSetFlags,
+    CGEventSetIntegerValueField,
+    CGEventSourceFlagsState,
+    kCGEventFlagMaskAlternate,
+    kCGEventFlagMaskCommand,
+    kCGEventFlagMaskControl,
+    kCGEventFlagMaskShift,
+    kCGEventSourceStateHIDSystemState,
+    kCGEventSourceUserData,
+    kCGHIDEventTap,
 )
 
 from .events import SYNTHETIC_EVENT_TAG

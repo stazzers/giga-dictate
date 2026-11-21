@@ -145,9 +145,9 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.0.1</string>
+    <string>3.0.6</string>
     <key>CFBundleVersion</key>
-    <string>3.0.1</string>
+    <string>3.0.6</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>
@@ -157,7 +157,7 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>NSAppleEventsUsageDescription</key>
     <string>GigaDictate использует события ввода для вставки распознанного текста под курсор.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>GigaDictate записывает микрофон при диктовке, записи встречи или калибровке голоса. Обработка выполняется локально.</string>
+    <string>GigaDictate записывает микрофон при диктовке или записи встречи. Обработка выполняется локально.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>В режиме созвона GigaDictate захватывает системный звук для локальной стенограммы. Изображение экрана не сохраняется.</string>
 </dict>

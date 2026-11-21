@@ -5,10 +5,12 @@ from dataclasses import dataclass
 
 import objc
 from AppKit import (
+    NSApplicationDidChangeScreenParametersNotification,
     NSBackingStoreBuffered,
     NSBezierPath,
     NSColor,
     NSCompositingOperationClear,
+    NSEvenOddWindingRule,
     NSEvent,
     NSFont,
     NSFontAttributeName,
@@ -23,6 +25,7 @@ from AppKit import (
     NSScreen,
     NSShadow,
     NSSize,
+    NSStatusWindowLevel,
     NSString,
     NSStringDrawingUsesFontLeading,
     NSStringDrawingUsesLineFragmentOrigin,
@@ -33,16 +36,13 @@ from AppKit import (
     NSVisualEffectMaterialHUDWindow,
     NSVisualEffectStateActive,
     NSVisualEffectView,
-    NSApplicationDidChangeScreenParametersNotification,
-    NSStatusWindowLevel,
-    NSWindowStyleMaskNonactivatingPanel,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorIgnoresCycle,
-    NSWorkspaceActiveSpaceDidChangeNotification,
-    NSWindowCollectionBehaviorCanJoinAllSpaces,
-    NSWindowCollectionBehaviorStationary,
     NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
     NSWorkspace,
+    NSWorkspaceActiveSpaceDidChangeNotification,
 )
 from ApplicationServices import (
     AXUIElementCopyAttributeValue,
@@ -59,7 +59,14 @@ from ApplicationServices import (
     kAXValueCGRectType,
     kAXValueCGSizeType,
 )
-from Foundation import NSObject, NSNotificationCenter, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import (
+    NSInsetRect,
+    NSNotificationCenter,
+    NSObject,
+    NSRunLoop,
+    NSRunLoopCommonModes,
+    NSTimer,
+)
 from PyObjCTools import AppHelper
 
 logger = logging.getLogger("giga_dictate.hud")
@@ -77,9 +84,7 @@ PREVIEW_MIN_WIDTH = 200.0
 PREVIEW_MAX_WIDTH = 540.0
 
 NUM_BARS = 5
-CENTER_WEIGHTS = tuple(
-    math.sin(((i + 0.5) / float(NUM_BARS)) * math.pi) ** 0.82 for i in range(NUM_BARS)
-)
+CENTER_WEIGHTS = (0.55, 0.85, 1.0, 0.85, 0.55)
 
 
 def locate_caret_or_cursor(
@@ -98,12 +103,10 @@ def locate_caret_or_cursor(
     Accurately resolves multi-screen geometries and avoids cross-display clamping.
     """
     screens_list = screens if screens is not None else NSScreen.screens()
-    screen = screens_list[0] if screens is not None and screens_list else (NSScreen.mainScreen() if screens is None else None)
+    screen = (screens[0] if screens is not None and screens else NSScreen.mainScreen()) or (screens_list[0] if screens_list else None)
     primary_h = screens_list[0].frame().size.height if screens_list else 900.0
     active_screen_frame = (
-        screens_list[0].visibleFrame()
-        if (screens is not None and screens_list)
-        else (screen.visibleFrame() if screen else NSRect(NSPoint(0, 0), NSSize(1440, 900)))
+        screen.visibleFrame() if screen else NSRect(NSPoint(0, 0), NSSize(1440, 900))
     )
 
     target_x = target_pt.x if target_pt is not None else None
@@ -280,6 +283,17 @@ class VoiceWaveformView(NSView):
             self.color_indigo, self.color_purple
         )
 
+        # Starting Amber / Soft Cyan Gradient
+        self.color_amber = NSColor.colorWithRed_green_blue_alpha_(
+            255 / 255, 180 / 255, 60 / 255, 1.0
+        )
+        self.color_soft_blue = NSColor.colorWithRed_green_blue_alpha_(
+            80 / 255, 200 / 255, 255 / 255, 1.0
+        )
+        self.grad_starting = NSGradient.alloc().initWithStartingColor_endingColor_(
+            self.color_amber, self.color_soft_blue
+        )
+
         # Soft drop shadow for high contrast over any wallpaper/window
         self.shadow = NSShadow.alloc().init()
         self.shadow.setShadowColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.45))
@@ -300,20 +314,22 @@ class VoiceWaveformView(NSView):
         self.state = state
         self.speed = max(0.6, min(3.2, speed))
 
-        # Snappy audio level tracking (reacts instantly to speech syllables)
+        # Responsive audio level tracking (fast attack, smooth natural release)
         if self.level > self.smoothed_level:
-            self.smoothed_level = self.smoothed_level * 0.15 + self.level * 0.85
+            self.smoothed_level = self.smoothed_level * 0.12 + self.level * 0.88
         else:
-            self.smoothed_level = self.smoothed_level * 0.55 + self.level * 0.45
+            self.smoothed_level = self.smoothed_level * 0.60 + self.level * 0.40
 
-        if self.smoothed_level < 0.010:
+        if self.smoothed_level < 0.008:
             self.smoothed_level = 0.0
 
         # Animation speed adapts dynamically to speech tempo & timbre
-        if self.smoothed_level > 0.015:
+        if self.smoothed_level > 0.010:
             self.time_offset += 0.075 * self.speed
         elif self.state == "transcribing":
             self.time_offset += 0.080
+        elif self.state == "starting":
+            self.time_offset += 0.060
 
         min_h = 4.5
         h = self.bounds().size.height if hasattr(self, "bounds") else 52.0
@@ -324,21 +340,24 @@ class VoiceWaveformView(NSView):
             center_weight = CENTER_WEIGHTS[i]
 
             if self.state == "recording":
-                if self.smoothed_level > 0.015:
+                if self.smoothed_level > 0.010:
                     # Dynamic wave tied directly to speech cadence & timbre
                     freq1 = math.sin(self.time_offset * 4.4 + i * 0.95)
                     freq2 = math.cos(self.time_offset * 7.0 - i * 0.70)
-                    oscillation = 0.60 + 0.40 * (freq1 * 0.60 + freq2 * 0.40)
+                    oscillation = 0.70 + 0.30 * (freq1 * 0.60 + freq2 * 0.40)
                     target = (
                         min_h
                         + (max_h - min_h)
-                        * (self.smoothed_level**0.82)
+                        * (self.smoothed_level**0.70)
                         * center_weight
                         * oscillation
                     )
                 else:
                     # Silence ('молчок'): cleanly rests at minimum
                     target = min_h
+            elif self.state == "starting":
+                wave = (math.sin(self.time_offset * 4.5 + i * 0.85) + 1.0) * 0.5
+                target = min_h + 5.5 * wave * center_weight
             elif self.state == "transcribing":
                 wave = (math.sin(self.time_offset * 5.0 + i * 0.90) + 1.0) * 0.5
                 target = min_h + 18.0 * wave * center_weight
@@ -363,8 +382,12 @@ class VoiceWaveformView(NSView):
         w = bounds.size.width
         h = bounds.size.height
 
-        is_transcribing = self.state == "transcribing"
-        current_grad = self.grad_purple if is_transcribing else self.grad_blue
+        if self.state == "transcribing":
+            current_grad = self.grad_purple
+        elif self.state == "starting":
+            current_grad = self.grad_starting
+        else:
+            current_grad = self.grad_blue
 
         NSGraphicsContext.saveGraphicsState()
         NSColor.clearColor().set()
@@ -392,6 +415,14 @@ class VoiceWaveformView(NSView):
                     bar_rect, corner_r, corner_r
                 )
                 current_grad.drawInBezierPath_angle_(path, 90.0)
+                if bh > 6.0:
+                    cap_h = min(bh * 0.45, 4.0)
+                    cap_rect = NSRect(NSPoint(bx, by + bh - cap_h), NSSize(bar_w, cap_h))
+                    cap_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        cap_rect, corner_r, corner_r
+                    )
+                    NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.28).setFill()
+                    cap_path.fill()
         else:
             # Full classic mode: 5 bold equalizer bars with soft drop shadow
             self.shadow.set()
@@ -412,14 +443,23 @@ class VoiceWaveformView(NSView):
                     bar_rect, corner_r, corner_r
                 )
                 current_grad.drawInBezierPath_angle_(path, 90.0)
+                if bh > 8.0:
+                    cap_h = min(bh * 0.40, 7.0)
+                    cap_rect = NSRect(NSPoint(bx, by + bh - cap_h), NSSize(bar_w, cap_h))
+                    cap_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        cap_rect, corner_r, corner_r
+                    )
+                    NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.32).setFill()
+                    cap_path.fill()
 
         NSGraphicsContext.restoreGraphicsState()
 
 
 class LiveHUDGlassBackdropView(NSVisualEffectView):
     """
-    Native macOS frosted glass view (NSVisualEffectView) with dynamic
-    transparency / matte regulation (glass / balanced / matte) and crisp 1px border.
+    Apple visionOS / Glisse liquid glass backdrop view (NSVisualEffectView) with
+    refractive 3D inner bezel, directional specular rim highlight, point specular
+    lens sheen, and dynamic transparency regulation.
     Active strictly in Live Preview mode.
     """
 
@@ -427,29 +467,37 @@ class LiveHUDGlassBackdropView(NSVisualEffectView):
         self = objc.super(LiveHUDGlassBackdropView, self).initWithFrame_(frame)
         if self is None:
             return None
-        self.glass_style = "glass"
-        self.glass_opacity = 0.22
+        self.glass_style = "liquid"
+        self.glass_opacity = 0.40
+        self.corner_radius = 18.0
 
         self.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         self.setState_(NSVisualEffectStateActive)
         self.setMaterial_(NSVisualEffectMaterialHUDWindow)
         self.setWantsLayer_(True)
         if self.layer() is not None:
-            self.layer().setCornerRadius_(18.0)
+            self.layer().setCornerRadius_(self.corner_radius)
             self.layer().setMasksToBounds_(True)
         return self
 
     def isOpaque(self) -> bool:
         return False
 
+    def setCornerRadius_(self, radius: float):
+        self.corner_radius = float(radius)
+        if self.layer() is not None:
+            self.layer().setCornerRadius_(self.corner_radius)
+        self.setNeedsDisplay_(True)
+
     def setGlassStyle_(self, style: str):
         self.glass_style = str(style)
         alphas = {
+            "liquid": 0.40,
             "glass": 0.22,
             "balanced": 0.55,
             "matte": 0.85,
         }
-        self.glass_opacity = alphas.get(self.glass_style, 0.22)
+        self.glass_opacity = alphas.get(self.glass_style, 0.40)
         self.setNeedsDisplay_(True)
 
     def drawRect_(self, dirtyRect):
@@ -461,20 +509,85 @@ class LiveHUDGlassBackdropView(NSVisualEffectView):
         h = bounds.size.height
 
         bg_rect = NSRect(NSPoint(1.0, 1.0), NSSize(w - 2.0, h - 2.0))
-        corner_r = 18.0
+        corner_r = min(getattr(self, "corner_radius", 18.0), h / 2.0)
         path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             bg_rect, corner_r, corner_r
         )
 
-        # Tint fill according to transparency setting (frosted glass to opaque matte)
-        NSColor.colorWithCalibratedWhite_alpha_(0.08, self.glass_opacity).setFill()
+        # 1. Glisse Charcoal Base Tint (matching --lg-surface: rgb(28 28 31 / alpha))
+        NSColor.colorWithRed_green_blue_alpha_(
+            26 / 255, 26 / 255, 30 / 255, self.glass_opacity
+        ).setFill()
         path.fill()
 
-        # Crisp subtle border
-        border_alpha = 0.22 if self.glass_style == "glass" else 0.16
-        NSColor.colorWithCalibratedWhite_alpha_(1.0, border_alpha).setStroke()
-        path.setLineWidth_(1.0)
-        path.stroke()
+        # 2. Refractive 3D Inner Bezel & Radial Lens Sheen (Clipped to capsule)
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+
+        is_liquid = self.glass_style in ("liquid", "glass")
+        # Top internal light bleed (convex refraction catching ambient key light)
+        glow_h = min(22.0, h * 0.5)
+        glow_rect = NSRect(NSPoint(0.0, h - glow_h), NSSize(w, glow_h))
+        top_glow_alpha = 0.16 if self.glass_style == "liquid" else (0.12 if is_liquid else 0.08)
+        top_glow_grad = NSGradient.alloc().initWithStartingColor_endingColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.0),
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, top_glow_alpha),
+        )
+        top_glow_grad.drawInRect_angle_(glow_rect, 90.0)
+
+        # Bottom occlusion depth (simulating ambient occlusion and glass thickness)
+        occ_h = min(18.0, h * 0.4)
+        occ_rect = NSRect(NSPoint(0.0, 0.0), NSSize(w, occ_h))
+        bottom_occ_alpha = 0.22 if self.glass_style == "liquid" else (0.16 if is_liquid else 0.20)
+        bottom_occ_grad = NSGradient.alloc().initWithStartingColor_endingColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, bottom_occ_alpha),
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.0),
+        )
+        bottom_occ_grad.drawInRect_angle_(occ_rect, 90.0)
+
+        # Point specular lens sheen (.lg-glass::after top-left highlight)
+        sheen_alpha = 0.12 if self.glass_style == "liquid" else (0.08 if is_liquid else 0.04)
+        sheen_grad = NSGradient.alloc().initWithStartingColor_endingColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, sheen_alpha),
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.0),
+        )
+        sheen_center = NSPoint(w * 0.24, h * 0.82)
+        sheen_grad.drawFromCenter_radius_toCenter_radius_options_(
+            sheen_center, 0.0, sheen_center, max(w, h) * 0.70, 0
+        )
+        NSGraphicsContext.restoreGraphicsState()
+
+        # 3. Directional Specular Rim Highlight (Glisse facing = |nx + ny|, key light at 135°)
+        rim_w = 1.25
+        inner_rect = NSInsetRect(bg_rect, rim_w, rim_w)
+        inner_r = max(0.0, corner_r - rim_w)
+        inner_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            inner_rect, inner_r, inner_r
+        )
+        rim_path = NSBezierPath.bezierPath()
+        rim_path.appendBezierPath_(path)
+        rim_path.appendBezierPath_(inner_path)
+        rim_path.setWindingRule_(NSEvenOddWindingRule)
+
+        apex_alpha = 0.78 if self.glass_style == "liquid" else (0.60 if is_liquid else 0.40)
+        base_alpha = 0.22 if self.glass_style == "liquid" else (0.18 if is_liquid else 0.14)
+        rim_grad = NSGradient.alloc().initWithStartingColor_endingColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, apex_alpha),
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, base_alpha),
+        )
+        rim_grad.drawInBezierPath_angle_(rim_path, 135.0)
+
+        # 4. Razor Inset Edge (0.5px line defining inner glass bevel transition)
+        razor_rect = NSInsetRect(bg_rect, 1.25, 1.25)
+        razor_r = max(0.0, corner_r - 1.25)
+        razor_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            razor_rect, razor_r, razor_r
+        )
+        razor_alpha = 0.14 if self.glass_style == "liquid" else (0.10 if is_liquid else 0.08)
+        NSColor.colorWithCalibratedWhite_alpha_(1.0, razor_alpha).setStroke()
+        razor_path.setLineWidth_(0.5)
+        razor_path.stroke()
+
         NSGraphicsContext.restoreGraphicsState()
 
 
@@ -491,8 +604,8 @@ class LiveHUDContainerView(NSView):
         if self is None:
             return None
         self.is_preview_enabled = True
-        self.glass_style = "glass"
-        self.glass_opacity = 0.22
+        self.glass_style = "liquid"
+        self.glass_opacity = 0.40
 
         self.glass_backdrop = LiveHUDGlassBackdropView.alloc().initWithFrame_(frame)
         self.glass_backdrop.setGlassStyle_(self.glass_style)
@@ -511,6 +624,7 @@ class LiveHUDContainerView(NSView):
     def setGlassStyle_(self, style: str):
         self.glass_style = str(style)
         alphas = {
+            "liquid": 0.40,
             "glass": 0.22,
             "balanced": 0.55,
             "matte": 0.85,
@@ -571,7 +685,7 @@ class VoiceInputHUD(NSObject):
         self.state = "idle"
         self._is_visible = False
         self.live_preview_enabled = True
-        self.glass_style = "glass"
+        self.glass_style = "liquid"
         self._current_text = "..."
         self.text_font = NSFont.systemFontOfSize_weight_(13.5, 0.2)
         self._anchor_center_x = None
@@ -600,14 +714,13 @@ class VoiceInputHUD(NSObject):
         self.panel.setLevel_(FLOATING_LEVEL)
         self.panel.setOpaque_(False)
         self.panel.setBackgroundColor_(NSColor.clearColor())
-        self.panel.setHasShadow_(False)
+        self.panel.setHasShadow_(self.live_preview_enabled)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setIgnoresMouseEvents_(True)
         self.panel.setAlphaValue_(0.0)
 
         self.panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorIgnoresCycle
         )
@@ -632,6 +745,11 @@ class VoiceInputHUD(NSObject):
         self.text_label.setAlignment_(NSTextAlignmentLeft)
         self.text_label.setFont_(self.text_font)
         self.text_label.setTextColor_(NSColor.whiteColor())
+        text_shadow = NSShadow.alloc().init()
+        text_shadow.setShadowColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.45))
+        text_shadow.setShadowOffset_(NSSize(0.0, -1.0))
+        text_shadow.setShadowBlurRadius_(2.0)
+        self.text_label.setShadow_(text_shadow)
         cell = self.text_label.cell()
         if cell is not None:
             cell.setWraps_(True)
@@ -767,6 +885,8 @@ class VoiceInputHUD(NSObject):
                 self.wave_view.setNeedsDisplay_(True)
 
         if self.panel is not None:
+            self.panel.setHasShadow_(self.live_preview_enabled)
+            self.panel.invalidateShadow()
             if self._is_visible:
                 if self._anchor_center_x is not None and self._anchor_top_y is not None:
                     # Dynamically calculate HUD origin relative to cached anchor without blocking IPC
@@ -796,6 +916,9 @@ class VoiceInputHUD(NSObject):
         self.live_preview_enabled = bool(enabled)
         if not self.live_preview_enabled:
             self._current_text = ""
+        if self.panel is not None:
+            self.panel.setHasShadow_(self.live_preview_enabled)
+            self.panel.invalidateShadow()
         self._update_layout()
 
     def setPreviewText_(self, text: str):
@@ -841,8 +964,8 @@ class VoiceInputHUD(NSObject):
             )
         self._update_layout()
 
+        self.panel.setAlphaValue_(1.0)
         self.panel.orderFrontRegardless()
-        self.panel.animator().setAlphaValue_(1.0)
         self._start_timer()
         self._request_caret()
 
@@ -985,11 +1108,18 @@ class VoiceInputHUD(NSObject):
     def onTimerTick_(self, timer):
         level = 0.0
         speed = 1.0
-        if self.audio_recorder is not None and self.state == "recording":
-            if hasattr(self.audio_recorder, "get_audio_state"):
-                level, speed = self.audio_recorder.get_audio_state()
-            else:
-                level = self.audio_recorder.get_level()
+        is_active_capture = False
+        if self.audio_recorder is not None:
+            is_active_capture = getattr(self.audio_recorder, "is_recording", False)
+            if self.state == "recording" and is_active_capture:
+                if hasattr(self.audio_recorder, "get_audio_state"):
+                    level, speed = self.audio_recorder.get_audio_state()
+                else:
+                    level = self.audio_recorder.get_level()
+
+        current_state = self.state
+        if self.state == "recording" and not is_active_capture:
+            current_state = "starting"
 
         if self.wave_view:
-            self.wave_view.updateLevel_state_speed_(level, self.state, speed)
+            self.wave_view.updateLevel_state_speed_(level, current_state, speed)

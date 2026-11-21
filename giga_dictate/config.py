@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import platform
 import sys
@@ -8,6 +9,16 @@ CONFIG_DIR = os.path.expanduser("~/.config/giga_dictate")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 LAUNCH_AGENT_DIR = os.path.expanduser("~/Library/LaunchAgents")
 LAUNCH_AGENT_PLIST = os.path.join(LAUNCH_AGENT_DIR, "com.salute.gigadictate.plist")
+
+
+def remove_legacy_voice_profile():
+    """Remove the retired biometric profile without reading or loading it."""
+    try:
+        os.remove(os.path.join(CONFIG_DIR, "owner_voice_profile.json"))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logging.getLogger("giga_dictate.config").warning("retired_voice_profile_cleanup_failed")
 
 
 def is_launch_at_login_enabled() -> bool:
@@ -99,18 +110,19 @@ class AppConfig:
     custom_hotkey: str | None = None
     launch_at_login: bool = False
     live_hud_preview: bool = True  # Real-time streaming transcription preview in floating HUD
-    hud_glass_style: str = "glass"  # "glass" (vibrant translucent), "balanced" (frosted), "matte" (high-contrast opaque)
+    hud_glass_style: str = "liquid"  # Apple Liquid Glass (Glisse) design
     audio_ducking: bool = True  # Automatically lower system volume during recording to prevent speaker bleed
     ducking_volume: float = 0.12  # Target volume level during ducking (0.0 to 1.0)
 
     @property
     def hud_glass_alpha(self) -> float:
         alphas = {
+            "liquid": 0.40,
             "glass": 0.25,
             "balanced": 0.55,
             "matte": 0.85,
         }
-        return alphas.get(self.hud_glass_style, 0.25)
+        return alphas.get(self.hud_glass_style, 0.40)
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -123,6 +135,7 @@ class AppConfig:
                 )
                 if config.custom_hotkey is None and config.hotkey != "right_cmd":
                     config.custom_hotkey = config.hotkey
+                config.hud_glass_style = "liquid"
                 config.launch_at_login = is_launch_at_login_enabled()
                 return config
             except Exception as e:

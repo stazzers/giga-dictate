@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 import resource
 import sys
-import tempfile
 import threading
 import time
 from unittest.mock import patch
@@ -24,18 +23,33 @@ def main():
     import gigaam
     import numpy as np
     from giga_dictate.engine import GigaAMEngine
+    from giga_dictate.diarization import OnlineDiarizer
     from giga_dictate.meeting_session import MeetingSession
     from giga_dictate.meeting_types import AudioFrame, MeetingOptions, MeetingState
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--mode", choices=("online", "room"), default="room")
+    parser.add_argument("--speaker-count", type=int)
     parser.add_argument("--audio", type=Path, default=ROOT / "example.wav")
     parser.add_argument("--device", choices=("mps", "cpu"), default="mps")
     parser.add_argument("--output", type=Path, default=ROOT / "build/meeting-benchmark.json")
     args = parser.parse_args()
     if args.seconds < 1:
         parser.error("--seconds must be positive")
+    options = MeetingOptions(args.mode, speaker_count=args.speaker_count)
+    options.validate()
+    refinement = {}
+    original_refine = OnlineDiarizer.refine
+
+    def timed_refine(diarizer, turns, evidence):
+        started = time.monotonic()
+        refinement["evidence_turns"] = len(evidence)
+        try:
+            return original_refine(diarizer, turns, evidence)
+        finally:
+            refinement["wall_seconds"] = round(time.monotonic() - started, 4)
+            refinement.update(diarizer.refinement_stats)
     cache = Path.home() / ".cache/gigaam"
     weights, tokenizer = cache / "v3_e2e_ctc.ckpt", cache / "v3_e2e_ctc_tokenizer.model"
     if not weights.is_file() or not tokenizer.is_file():
@@ -49,7 +63,7 @@ def main():
           patch.object(gigaam, "_download_tokenizer", return_value=str(tokenizer)),
           patch("urllib.request.urlopen", side_effect=RuntimeError("Offline benchmark")),
           patch("socket.create_connection", side_effect=RuntimeError("Offline benchmark")),
-          tempfile.TemporaryDirectory(prefix="giga-meeting-benchmark-") as tmp):
+          patch.object(OnlineDiarizer, "refine", autospec=True, side_effect=timed_refine)):
         engine = GigaAMEngine(device=args.device)
         if not engine.load():
             raise SystemExit("Could not load cached GigaAM")
@@ -72,10 +86,10 @@ def main():
             if event["kind"] == "complete":
                 done.set()
 
-        manager = MeetingSession(engine, Path(tmp) / "unused-profile.json", notify,
+        manager = MeetingSession(engine, notify=notify,
             microphone_factory=ReplayCapture, system_factory=ReplayCapture,
             clock=lambda: timeline[0])
-        manager.start(MeetingOptions(args.mode))
+        manager.start(options)
         if not ready.wait(20):
             manager.cancel()
             raise SystemExit("Meeting preparation failed")
@@ -108,6 +122,7 @@ def main():
                                                  for turn in manager.result.turns),
                   "max_queued_seconds": manager.max_queued_seconds,
                   "error_count": len(manager.result.errors),
+                  "refinement": refinement,
                   "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                   "notes": "Accelerated replay of repeated file audio; no live capture, quality or energy measurement."}
         manager.result.clear()

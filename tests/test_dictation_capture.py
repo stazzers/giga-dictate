@@ -59,6 +59,9 @@ class DictationCaptureRegression(unittest.TestCase):
              patch("sounddevice.query_devices", return_value={"default_samplerate": 48000}):
             self.assertTrue(recorder.start())
             first, _ = recorder.stop()
+            # The production meeting handoff runs this full close on the audio
+            # control worker before allowing the other capture to open.
+            recorder.close()
             frames, errors = [], []
             meeting = MicrophoneStream(frames.append, errors.append)
             meeting.start()
@@ -71,16 +74,19 @@ class DictationCaptureRegression(unittest.TestCase):
         self.assertEqual(after_meeting.size, 512)
         self.assertEqual(duration, 512 / 16000)
 
-    def test_stop_releases_device_before_another_capture_opens(self):
+    def test_stop_releases_device_before_another_capture(self):
         device = AudioDevice()
         recorder = AudioRecorder()
         with patch("giga_dictate.audio.sd.InputStream", side_effect=device.open):
             recorder.start()
             recorder.stop()
+            self.assertTrue(device.streams[0].stopped)
+            self.assertTrue(device.streams[0].closed)
+            recorder.close()
         self.assertTrue(device.streams[0].closed)
         self.assertIsNone(recorder._stream)
 
-    def test_repeat_dictations_use_fresh_device_and_preserve_preview(self):
+    def test_repeat_dictations_release_device_and_preserve_preview(self):
         device = AudioDevice()
         recorder = AudioRecorder()
         self.addCleanup(recorder.close)
@@ -90,6 +96,7 @@ class DictationCaptureRegression(unittest.TestCase):
                 preview = recorder.get_stream_snapshot_from(0)
                 audio, _ = recorder.stop()
                 np.testing.assert_array_equal(audio, preview)
+                self.assertTrue(device.streams[-1].stopped)
                 self.assertTrue(device.streams[-1].closed)
         self.assertEqual(len(device.streams), 5)
 

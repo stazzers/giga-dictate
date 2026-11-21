@@ -1,3 +1,4 @@
+import atexit
 import logging
 import threading
 import time
@@ -63,13 +64,15 @@ class AudioRecorder:
     """
     On-demand audio recorder capturing 16kHz float32 audio.
     Microphone is accessed ONLY while recording is active.
-    When idle, no audio streams or devices are kept open. Each recording opens a
-    fresh CoreAudio stream: another capture session can invalidate a paused one.
+    Every completed recording releases its stream. The app supplies an isolated
+    capture process so a native stop deadlock cannot retain the device forever.
     """
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, device: int | None = None):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, device: int | None = None,
+                 stream_factory=None):
         self.sample_rate = sample_rate
         self.device = device
+        self._stream_factory = stream_factory
         self._stream: sd.InputStream | None = None
         self._frames: list[np.ndarray] = []
         self._sample_count = 0
@@ -190,11 +193,12 @@ class AudioRecorder:
 
             # Vectorized RMS via BLAS scalar product (zero intermediate array allocations)
             rms = float(np.sqrt(np.dot(flat, flat) / n_samples))
-            if rms < 0.002:
+            if rms < 0.0012:
                 target = 0.0
                 instant_speed = 1.0
             else:
-                target = min(1.0, max(0.0, (rms - 0.002) * 35.0))
+                norm = min(1.0, max(0.0, (rms - 0.0012) * 45.0))
+                target = float(norm ** 0.60)
                 # Syllable delta and articulation / timbre proxy
                 delta_e = abs(rms - self._prev_rms)
                 self._prev_rms = rms
@@ -214,7 +218,7 @@ class AudioRecorder:
             if target > self._current_level:
                 self._current_level = self._current_level * 0.10 + target * 0.90
             else:
-                self._current_level = self._current_level * 0.50 + target * 0.50
+                self._current_level = self._current_level * 0.45 + target * 0.55
 
             # Smooth speed transition (faster cadence tracking)
             self._speech_speed = self._speech_speed * 0.60 + instant_speed * 0.40
@@ -224,15 +228,12 @@ class AudioRecorder:
     def start(self) -> bool:
         """
         Activates the microphone and starts capturing audio frames.
-        Thread-safe, non-blocking, and deadlock-free.
-        Never resumes an old AudioUnit after a meeting or input route change.
+        Native lifecycle calls must run on the serialized audio control worker.
         """
         with self._stream_mutex:
             with self._lock:
                 if self._recording:
                     return False
-            if not self._close_stream_locked():
-                return False
             with self._lock:
                 self._frames = []
                 self._sample_count = 0
@@ -241,10 +242,16 @@ class AudioRecorder:
                 self._prev_rms = 0.0
                 self._speech_speed = 1.0
 
-            # Open a fresh stream, including after another recorder used the mic.
+            if not self._close_stream_locked():
+                with self._lock:
+                    self._recording = False
+                return False
+
+            # Meeting handoff explicitly closes this stream before opening its own.
             for attempt in range(2):
                 try:
-                    self._stream = sd.InputStream(
+                    factory = self._stream_factory or sd.InputStream
+                    self._stream = factory(
                         samplerate=self.sample_rate,
                         channels=1,
                         dtype="float32",
@@ -269,18 +276,28 @@ class AudioRecorder:
             return False
 
     def stop(self) -> tuple[np.ndarray, float]:
-        """
-        Stops recording and closes microphone IO before handing off audio.
-        Returns audio frames instantly.
+        """Finish the immutable audio result, then release all native input IO."""
+        result = self.finish_capture()
+        self.close()
+        return result
+
+    def finish_capture(self) -> tuple[np.ndarray, float]:
+        """Detach all captured PCM before waiting for any native stop call.
+
+        The process-backed stream first drains its FIFO barrier, without waiting
+        for CoreAudio shutdown. No callback or late cleanup can consume this
+        immutable result or append data to the next dictation.
         """
         with self._stream_mutex:
+            drain = getattr(self._stream, "finish_capture", None)
+            if callable(drain):
+                drain()
             with self._lock:
                 self._recording = False
                 self._current_level = 0.0
                 frames = self._frames
                 self._frames = []
                 self._sample_count = 0
-            self._close_stream_locked()
 
         if frames:
             audio = np.concatenate(frames, axis=0).ravel()
@@ -289,6 +306,22 @@ class AudioRecorder:
         duration = len(audio) / self.sample_rate
 
         return audio, duration
+
+    def cancel_capture(self):
+        """Stop accepting callbacks without calling CoreAudio (safe for AppKit)."""
+        with self._lock:
+            self._recording = False
+            self._current_level = 0.0
+
+    def detach_exit_handler(self):
+        """Avoid Pa_Terminate waiting on the same hung native call at exit.
+
+        Only used when bounded shutdown of our audio worker has timed out.
+        In that case the OS releases devices when the process terminates.
+        """
+        handler = getattr(sd, "_exit_handler", None)
+        if handler is not None:
+            atexit.unregister(handler)
 
     def _close_stream_locked(self) -> bool:
         """Caller holds _stream_mutex, never _lock (callbacks may be finishing)."""
@@ -326,4 +359,4 @@ class AudioRecorder:
                 self._current_level = 0.0
                 self._frames = []
                 self._sample_count = 0
-            self._close_stream_locked()
+            return self._close_stream_locked()

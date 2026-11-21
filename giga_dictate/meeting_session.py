@@ -1,10 +1,10 @@
 """One worker owns inference/results; callbacks only enqueue bounded PCM."""
-from collections import deque
-from datetime import datetime
 import threading
 import time
+from collections import deque
+from datetime import datetime
 
-from .diarization import CAMPlusEmbedder, Enrollment, OnlineDiarizer, OwnerProfile
+from .diarization import CAMPlusEmbedder, OnlineDiarizer, SpeakerCountError
 from .meeting_audio import FrameNormalizer, MicrophoneStream
 from .meeting_models import find_models
 from .meeting_types import MeetingResult, MeetingState, Speaker, TranscriptTurn
@@ -12,16 +12,16 @@ from .vad import SileroProbability, StreamingVAD
 
 
 class MeetingSession:
-    def __init__(self, engine, profile_path, notify=lambda event: None, *,
+    def __init__(self, engine, notify=lambda event: None, *,
                  model_finder=find_models, microphone_factory=MicrophoneStream,
                  system_factory=None, vad_factory=SileroProbability,
                  embedder_factory=CAMPlusEmbedder, writer_factory=None, clock=time.monotonic):
         self.engine, self.notify = engine, notify
-        self.profile = OwnerProfile(profile_path)
         self.model_finder, self.microphone_factory = model_finder, microphone_factory
         self.system_factory, self.writer_factory = system_factory, writer_factory
         self.vad_factory, self.embedder_factory = vad_factory, embedder_factory
         self.clock = clock
+        self.prepare_capture = None
         self.state = MeetingState.IDLE
         self.generation = 0
         self.result = None
@@ -145,6 +145,8 @@ class MeetingSession:
     def _run(self, session_id):
         result = MeetingResult(session_id, datetime.now().astimezone())
         writer = None
+        diarizer = None
+        speaker_evidence = {}
         vads, normalizers = {}, {}
         watcher = None
         processing_start = None
@@ -154,14 +156,18 @@ class MeetingSession:
             if not self.engine.is_loaded:
                 raise ValueError("Дождитесь загрузки GigaAM перед началом встречи")
             embedder = self.embedder_factory(models / "campplus.onnx")
-            owner = self.profile.load() if self.options.mode == "room" else None
-            diarizer = OnlineDiarizer(embedder, owner=owner)
-            enrollment = Enrollment(embedder) if self.options.mode == "enrollment" else None
+            online = self.options.mode == "online"
+            count = self.options.speaker_count
+            diarizer = OnlineDiarizer(embedder, speaker_offset=1 if online else 0,
+                                     speaker_count=None if count is None else count - int(online))
             result.speakers.update(diarizer.speakers)
-            result.speakers["owner"] = Speaker("owner", "Вы")
+            if online:
+                result.speakers["speaker-1"] = Speaker("speaker-1", "Спикер 1")
             sources = ["microphone"] + (["system"] if self.options.mode == "online" else [])
             for name in sources:
                 vads[name] = StreamingVAD(name, self.vad_factory(models / "silero_vad.onnx"))
+            if self.prepare_capture is not None:
+                self.prepare_capture()
             if self._stop.is_set():
                 return
             if self.options.audio_path:
@@ -199,11 +205,8 @@ class MeetingSession:
                 processing_start = segment.start
                 if self._cancel.is_set():
                     return
-                if enrollment:
-                    enrollment.feed(segment)
-                    return
                 if self.options.mode == "online" and segment.source == "microphone":
-                    pieces = [(segment, "owner")]
+                    pieces = [(segment, "speaker-1")]
                 else:
                     pieces = diarizer.split(segment)
                 result.speakers.update({key: value for key, value in diarizer.speakers.items()
@@ -215,8 +218,10 @@ class MeetingSession:
                     if text:
                         turn = TranscriptTurn(len(result.turns) + 1, piece.start, piece.end,
                             piece.source, speaker, text,
-                            "uncertain" if speaker == "unknown" else "automatic")
+                            "uncertain" if speaker == "unknown" or speaker.startswith("pending-") else "automatic")
                         result.turns.append(turn)
+                        if piece.speaker_evidence is not None:
+                            speaker_evidence[turn.id] = piece.speaker_evidence
                         self._event("turn", session_id=session_id, turn=turn)
 
             while not self._cancel.is_set():
@@ -238,8 +243,6 @@ class MeetingSession:
                     writer.feed(frame.source, start, pcm)
                 for segment in vads[frame.source].feed(start, pcm):
                     recognize(segment)
-                if enrollment and self.elapsed >= 20:
-                    self.stop()
             self._stop.set()
             if watcher:
                 watcher.join(timeout=35)
@@ -253,9 +256,6 @@ class MeetingSession:
                             recognize(segment)
                     for segment in vads[name].flush():
                         recognize(segment)
-                if enrollment and not self._failure:
-                    self.profile.save(enrollment.finish())
-                    result.enrollment_complete = True
         except ValueError as error:
             processing_failed = True
             # Only controlled validation messages; inference exceptions can contain
@@ -272,6 +272,33 @@ class MeetingSession:
                 self._close_sources()
             self.stopped = self.stopped or self.clock()
             result.duration = self.elapsed
+            if diarizer is not None:
+                if not self._cancel.is_set():
+                    preliminary = [(turn.speaker_id, turn.attribution) for turn in result.turns]
+                    try:
+                        diarizer.refine(result.turns, speaker_evidence)
+                    except SpeakerCountError as error:
+                        for turn, (key, attribution) in zip(result.turns, preliminary):
+                            turn.speaker_id, turn.attribution = key, attribution
+                        result.errors.append(str(error))
+                    except Exception:
+                        for turn, (key, attribution) in zip(result.turns, preliminary):
+                            turn.speaker_id, turn.attribution = key, attribution
+                        result.errors.append("Не удалось уточнить спикеров; сохранены предварительные назначения")
+                result.speakers.update({key: value for key, value in diarizer.speakers.items()
+                                        if key not in result.speakers})
+                for turn in result.turns:
+                    provisional = turn.speaker_id.startswith("pending-")
+                    turn.speaker_id = diarizer.resolve_speaker(turn.speaker_id)
+                    if turn.speaker_id == "unknown":
+                        turn.attribution = "uncertain"
+                    elif provisional:
+                        turn.attribution = "automatic"
+                # Provisional clusters which never produced text are not people
+                # and must not appear as phantom participants in the result UI.
+                used = {turn.effective_speaker_id for turn in result.turns}
+                result.speakers = {key: speaker for key, speaker in result.speakers.items() if key in used}
+            speaker_evidence.clear()
             if self._failure:
                 result.errors.append(self._failure)
                 if self._frames or (processing_failed and processing_start is not None):

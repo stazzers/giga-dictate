@@ -585,11 +585,15 @@ class TestLiveHUDPreview(IsolatedTestCase):
     def test_hud_glass_style_and_opacity_persistence(self):
         """Verify glass style configuration and opacity levels (glass, balanced, matte)."""
         config = AppConfig()
-        self.assertEqual(config.hud_glass_style, "glass")
-        self.assertAlmostEqual(config.hud_glass_alpha, 0.25)
+        self.assertEqual(config.hud_glass_style, "liquid")
+        self.assertAlmostEqual(config.hud_glass_alpha, 0.40)
 
         hud = VoiceInputHUD.alloc().init()
         self.addCleanup(hud.close)
+        hud.setGlassStyle_("liquid")
+        self.assertEqual(hud.container_view.glass_style, "liquid")
+        self.assertAlmostEqual(hud.container_view.glass_opacity, 0.40)
+
         hud.setGlassStyle_("matte")
         self.assertEqual(hud.container_view.glass_style, "matte")
         self.assertAlmostEqual(hud.container_view.glass_opacity, 0.85)

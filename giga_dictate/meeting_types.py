@@ -21,12 +21,17 @@ class MeetingOptions:
     mode: str = "online"
     device: int | None = None
     audio_path: str | None = None
+    speaker_count: int | None = None
 
     def validate(self):
-        if self.mode not in ("online", "room", "enrollment"):
+        if self.mode not in ("online", "room"):
             raise ValueError("Неизвестный режим встречи")
         if self.audio_path and Path(self.audio_path).suffix.lower() not in (".wav", ".m4a"):
             raise ValueError("Выберите файл .wav или .m4a")
+        maximum = 16 if self.mode == "online" else 15
+        if self.speaker_count is not None and (type(self.speaker_count) is not int
+                                               or not 1 <= self.speaker_count <= maximum):
+            raise ValueError(f"Количество голосов должно быть от 1 до {maximum}")
 
 
 @dataclass(frozen=True)
@@ -43,11 +48,23 @@ class AudioFrame:
 
 
 @dataclass
+class SpeakerEvidence:
+    """Small session-only acoustic summary; contains no PCM or transcript."""
+    vectors: np.ndarray = field(repr=False)
+    weights: np.ndarray = field(repr=False)
+    speech_seconds: float = 0.0
+    intervals: np.ndarray | None = field(default=None, repr=False)
+    quality: np.ndarray | None = field(default=None, repr=False)
+
+
+@dataclass
 class SpeechSegment:
     source: str
     start: float
     end: float
     pcm: np.ndarray = field(repr=False)
+    speech_mask: np.ndarray | None = field(default=None, repr=False)
+    speaker_evidence: SpeakerEvidence | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -86,7 +103,6 @@ class MeetingResult:
     speakers: dict[str, Speaker] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     audio_path: str | None = None
-    enrollment_complete: bool = False
 
     def ordered_turns(self):
         return sorted(self.turns, key=lambda turn: (turn.start, turn.id))

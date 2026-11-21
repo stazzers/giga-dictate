@@ -1,11 +1,10 @@
-from dataclasses import dataclass, field
-
 import gc
 import logging
 import os
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 
 import gigaam
 import numpy as np
@@ -15,9 +14,15 @@ from .audio import split_audio_into_chunks
 
 logger = logging.getLogger("giga_dictate.engine")
 
-# Optimize PyTorch CPU thread pool to prevent thread contention and background CPU wakeups
+_SPACES_RE = re.compile(r"\s+")
+
+# Apple Silicon Metal Performance Shaders (MPS) runtime optimizations
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# Optimize PyTorch thread pool for Apple Silicon Performance and Efficiency cores
 try:
-    torch.set_num_threads(min(4, os.cpu_count() or 1))
+    cpu_cores = os.cpu_count() or 4
+    torch.set_num_threads(min(cpu_cores, 8))
 except (RuntimeError, ValueError) as e:
     logger.debug(f"PyTorch thread count setting error ignored: {e}")
 
@@ -231,7 +236,7 @@ class GigaAMEngine:
                             else first
                         )
                         if isinstance(raw, str):
-                            text = raw.strip()
+                            text = _SPACES_RE.sub(" ", raw.replace("⁇", "").replace("\ufffd", "")).strip()
                             if text:
                                 results.append(text)
                 finally:
@@ -239,7 +244,7 @@ class GigaAMEngine:
 
         full_text = " ".join(results)
         # Normalize repeated spaces
-        full_text = re.sub(r"\s+", " ", full_text).strip()
+        full_text = _SPACES_RE.sub(" ", full_text).strip()
         return full_text
 
     @torch.inference_mode()
@@ -332,4 +337,4 @@ class GigaAMEngine:
         raw = first[0] if isinstance(first, (list, tuple)) and first else first
         if not isinstance(raw, str) or raw.strip().startswith(("⁇", "\ufffd")):
             return ""
-        return re.sub(r"\s+", " ", raw.replace("⁇", "").replace("\ufffd", "")).strip()
+        return _SPACES_RE.sub(" ", raw.replace("⁇", "").replace("\ufffd", "")).strip()

@@ -1,8 +1,8 @@
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
 
 # Ensure Homebrew path is in environment so ffmpeg and core utilities are found
 brew_bin = "/opt/homebrew/bin"

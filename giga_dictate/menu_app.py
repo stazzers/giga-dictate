@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import objc
 from AppKit import (
+    NSURL,
     NSAlert,
     NSAlertFirstButtonReturn,
     NSApplication,
@@ -32,19 +33,32 @@ from AppKit import (
     NSStatusBar,
     NSTextAlignmentCenter,
     NSTextField,
-    NSURL,
     NSVariableStatusItemLength,
     NSWindow,
     NSWindowStyleMaskClosable,
+    NSWindowStyleMaskFullSizeContentView,
     NSWindowStyleMaskTitled,
     NSWorkspace,
 )
-from Foundation import NSBundle, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import (
+    NSBundle,
+    NSObject,
+    NSRunLoop,
+    NSRunLoopCommonModes,
+    NSThread,
+    NSTimer,
+)
 from PyObjCTools import AppHelper
 
 from . import __version__
 from .audio import AudioRecorder
-from .config import AppConfig, is_launch_at_login_enabled, set_launch_at_login
+from .audio_control import AudioExecutor
+from .config import (
+    AppConfig,
+    is_launch_at_login_enabled,
+    remove_legacy_voice_profile,
+    set_launch_at_login,
+)
 from .ducking import AudioDucker
 from .engine import GigaAMEngine
 from .hotkey import (
@@ -54,11 +68,16 @@ from .hotkey import (
     vk_to_hotkey_identifier_and_label,
 )
 from .hud import VoiceInputHUD
-from .inserter import TextInserter
-from .sounds import SoundManager
+from .inserter import InsertionResult, TextInserter
+from .process_audio import ProcessInputStream
 from .session import DictationSession, DictationState, RecoveryText
+from .sounds import SoundManager
 
 logger = logging.getLogger("giga_dictate.menu_app")
+
+
+def _dispatch_audio(callback, *args):
+    AppHelper.callAfter(callback, *args)
 
 
 def _set_thread_qos_user_interactive():
@@ -157,14 +176,19 @@ class MenuAppController(NSObject):
         self._recovery_timer = None
         self._preview_future = None
         self.config = AppConfig.load()
+        remove_legacy_voice_profile()
         self.sounds = SoundManager(enabled=self.config.sound_feedback)
-        self.recorder = AudioRecorder(device=self.config.audio_device)
+        self.recorder = AudioRecorder(device=self.config.audio_device, stream_factory=ProcessInputStream)
         self.engine = GigaAMEngine(
             model_name=self.config.model_name,
             device=self.config.device,
         )
         self.inserter = TextInserter()
         self.ducker = AudioDucker()
+        self._audio_io = AudioExecutor()
+        self._audio_future = None
+        self._audio_unavailable = False
+        self._captured_audio_generation = None
         from .meeting_ui import MeetingUI
         self.meeting_ui = MeetingUI.alloc().initWithController_(self)
 
@@ -375,6 +399,8 @@ class MenuAppController(NSObject):
             status_text = f"⚠️ Ошибка: {self._model_error[:40]}"
         elif not self.engine.is_loaded:
             status_text = f"⏳ {self._model_progress_str or 'Загрузка модели GigaAM-v3...'}"
+        elif self.audio_busy:
+            status_text = "⏳ Освобождение микрофона..."
         elif self.hotkey_listener._tap is None:
             status_text = "⚠️ Клавиша не активна (нужен доступ в Настройках)"
         else:
@@ -419,7 +445,9 @@ class MenuAppController(NSObject):
             action_title, "onMenuToggleRecord:", ""
         )
         toggle_item.setTarget_(self)
-        toggle_item.setEnabled_(not meeting_busy and self.engine.is_loaded and not self._model_reloading and self.session.state not in (DictationState.TRANSCRIBING, DictationState.INSERTING))
+        toggle_item.setEnabled_(not meeting_busy and self.engine.is_loaded and not self._model_reloading
+                               and self.session.state not in (DictationState.TRANSCRIBING, DictationState.INSERTING)
+                               and (self.session.state == DictationState.RECORDING or not self.audio_busy))
         menu.addItem_(toggle_item)
         self._toggle_menu_item = toggle_item
 
@@ -427,11 +455,10 @@ class MenuAppController(NSObject):
         if meeting is not None:
             for title, action, enabled in (
                 ("⏹ Завершить встречу" if meeting.session.busy else "🎙 Начать встречу / созвон…",
-                 "onStart:", not self.session.busy and not self._model_reloading and not meeting.preparing_assets),
+                 "onStart:", not self.session.busy and not self._model_reloading
+                 and not meeting.preparing_assets and not self.audio_busy),
                 ("Открыть стенограмму встречи", "onShowResult:", meeting.result is not None),
                 ("Подготовить модели встреч…", "onPrepareModels:", not meeting_busy and not self.session.busy),
-                ("Записать мой голос (20 сек)…", "onEnroll:", not meeting_busy and not self.session.busy and not self._model_reloading),
-                ("Удалить мой голосовой профиль", "onDeleteProfile:", not meeting_busy),
             ):
                 item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
                 item.setTarget_(meeting)
@@ -546,29 +573,6 @@ class MenuAppController(NSObject):
         preview_item.setState_(1 if self.config.live_hud_preview else 0)
         menu.addItem_(preview_item)
 
-        # 6.1 HUD Glass Transparency Submenu
-        glass_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Стиль стекла HUD", None, ""
-        )
-        glass_sub = NSMenu.alloc().init()
-        glass_options = [
-            ("glass", "Стеклянный (Высокая прозрачность)"),
-            ("balanced", "Сбалансированный (Матовое стекло)"),
-            ("matte", "Матовый (Плотный контраст)"),
-        ]
-        for style_key, title in glass_options:
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                title, "onSelectGlassStyle:", ""
-            )
-            item.setTarget_(self)
-            item.setRepresentedObject_(style_key)
-            item.setState_(1 if self.config.hud_glass_style == style_key else 0)
-            glass_sub.addItem_(item)
-
-        glass_menu_item.setSubmenu_(glass_sub)
-        glass_menu_item.setEnabled_(self.config.live_hud_preview)
-        menu.addItem_(glass_menu_item)
-
         sound_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Звуковые сигналы", "onToggleSound:", ""
         )
@@ -654,16 +658,23 @@ class MenuAppController(NSObject):
             self.start_recording(manual=True)
 
     def on_hotkey_start(self):
-        """Called by hotkey listener on background thread."""
-        logger.info("on_hotkey_start -> dispatching start_recording to main thread")
-        AppHelper.callAfter(self.start_recording)
+        """Called by hotkey listener."""
+        if NSThread.isMainThread():
+            self.start_recording()
+        else:
+            AppHelper.callAfter(self.start_recording)
 
     def on_hotkey_stop(self):
-        """Called by hotkey listener on background thread."""
-        logger.info("on_hotkey_stop -> dispatching stop_and_transcribe to main thread")
-        AppHelper.callAfter(self.stop_and_transcribe)
+        """Called by hotkey listener."""
+        if NSThread.isMainThread():
+            self.stop_and_transcribe()
+        else:
+            AppHelper.callAfter(self.stop_and_transcribe)
 
     def start_recording(self, manual: bool = False):
+        if self.audio_busy:
+            self.hotkey_listener.reset_state()
+            return
         if self._meeting_busy():
             self.hotkey_listener.reset_state()
             return
@@ -679,21 +690,13 @@ class MenuAppController(NSObject):
             return
         generation = self.session.generation
         try:
-            if not self.recorder.start():
-                self._finish_session(generation, "Не удалось включить микрофон")
-                return
             self.hotkey_listener.set_recording(True)
             self._preview_session_id += 1
             self.engine.reset_preview_cache()
-            if self.config.audio_ducking:
-                self.ducker.duck(target_volume=self.config.ducking_volume)
-            self.update_status_title("Запись...", recording=True)
-            self.sounds.play_start()
+            self.update_status_title("Включение микрофона...", recording=True)
             self.hud.showRecording()
             self.update_menu_status()
-            if self.config.live_hud_preview:
-                self._start_preview_timer()
-            logger.info("session_started session=%s", generation)
+            self._queue_audio(self._start_audio, generation, self._audio_started)
         except Exception:
             logger.warning("recording_start_failed session=%s", generation)
             self._finish_session(generation, "Ошибка запуска записи")
@@ -705,17 +708,123 @@ class MenuAppController(NSObject):
         self.session.state = DictationState.TRANSCRIBING
         self._preview_session_id += 1
         self._stop_preview_timer()
-        self.ducker.unduck()
         self.hotkey_listener.reset_state()
-        try:
-            audio, duration = self.recorder.stop()
-            self.sounds.play_stop()
-            self.hud.showTranscribing()
-            self.update_status_title("Обработка...")
-            self.update_menu_status()
-        except Exception:
-            self._finish_session(generation, "Ошибка остановки записи")
+        self.hud.showTranscribing()
+        self.update_status_title("Остановка микрофона...")
+        self.update_menu_status()
+        self._queue_audio(self._stop_audio, generation)
+
+    @property
+    def audio_busy(self):
+        return self._audio_unavailable or (self._audio_future is not None and not self._audio_future.done())
+
+    @objc.python_method
+    def _queue_audio(self, function, generation, callback=None):
+        future = self._audio_io.submit(function, generation)
+        self._audio_future = future
+        future.add_done_callback(lambda done: _dispatch_audio(self._audio_task_done, generation, done, callback))
+        AppHelper.callLater(5.0, self._audio_timeout, generation, future)
+        return future
+
+    @objc.python_method
+    def _audio_task_done(self, generation, future, callback=None):
+        if self._shutting_down:
             return
+        if future is self._audio_future:
+            self._audio_unavailable = future.cancelled() or future.exception() is not None
+        if callback is not None:
+            try:
+                result = future.result()
+            except Exception:
+                result = False
+            callback(generation, result)
+        self.update_menu_status()
+
+    @objc.python_method
+    def _audio_timeout(self, generation, future):
+        if self._shutting_down or future.done():
+            return
+        self._audio_unavailable = True
+        self.recorder.cancel_capture()
+        logger.warning("audio_control_timeout session=%s", generation)
+        if self._captured_audio_generation == generation:
+            # The full recording has already reached ASR. Cleanup deadlines must
+            # not cancel transcription/insertion or replace it with preview text.
+            self.update_menu_status()
+            return
+        if self.session.accepts(generation) and self.session.busy:
+            text = self.engine._last_preview_text
+            if isinstance(text, str) and text:
+                self.recovery.remember(text)
+                self._arm_recovery_expiry()
+            self._finish_session(generation, "Аудиоустройство не ответило. Сохраняю доступный текст и освобождаю микрофон.")
+        self.update_menu_status()
+
+    @objc.python_method
+    def _start_audio(self, generation):
+        logger.info("audio_start_begin session=%s", generation)
+        try:
+            # Change output volume before input IO starts, not while HAL is busy.
+            if self.config.audio_ducking:
+                self.ducker.duck(target_volume=self.config.ducking_volume)
+            if self._shutting_down or not self.session.accepts(generation) or not self.session.busy:
+                self._release_audio()
+                return False
+            if not self.recorder.start():
+                self.ducker.unduck()
+                return False
+            # A watchdog may have cancelled the session while CoreAudio was
+            # opening. Release that late stream on this same worker.
+            if self._shutting_down or not self.session.accepts(generation) or not self.session.busy:
+                self._release_audio()
+                return False
+            return True
+        except Exception:
+            self.ducker.unduck()
+            return False
+
+    @objc.python_method
+    def _audio_started(self, generation, success):
+        if not self.session.accepts(generation) or self.session.state != DictationState.RECORDING:
+            return
+        if not success:
+            self._finish_session(generation, "Не удалось включить микрофон")
+            return
+        self.update_status_title("Запись...", recording=True)
+        self.sounds.play_start()
+        if self.config.live_hud_preview:
+            self._start_preview_timer()
+        logger.info("session_started session=%s", generation)
+
+    @objc.python_method
+    def _stop_audio(self, generation):
+        logger.info("audio_stop_begin session=%s", generation)
+        try:
+            # Drain tail speech (~80ms) from hardware ringbuffer before pipe cutoff
+            time.sleep(0.08)
+            audio, duration = self.recorder.finish_capture()
+        except Exception:
+            _dispatch_audio(self._audio_stopped, generation, None, 0, "Ошибка остановки записи")
+            self._release_audio(generation)
+            return
+        self._captured_audio_generation = generation
+        _dispatch_audio(self._audio_stopped, generation, audio, duration, "")
+        # Release input IO before touching output HAL properties.
+        if self.recorder.close() is False:
+            raise RuntimeError("Microphone capture has not exited")
+        logger.info("audio_restore_volume_begin session=%s", generation)
+        self.ducker.unduck()
+        logger.info("audio_stop_complete session=%s", generation)
+
+    @objc.python_method
+    def _audio_stopped(self, generation, audio, duration, error):
+        if self._shutting_down or not self.session.accepts(generation) or self.session.state != DictationState.TRANSCRIBING:
+            return
+        if error:
+            self._finish_session(generation, error)
+            return
+        self.sounds.play_stop()
+        self.update_status_title("Обработка...")
         logger.info("recording_stopped session=%s duration_s=%.3f", generation, duration)
 
         def worker():
@@ -768,7 +877,11 @@ class MenuAppController(NSObject):
                 conceal_clipboard=self.config.conceal_clipboard, delay=self.config.paste_delay,
             )
             def done(completed):
-                AppHelper.callAfter(self._insertion_ready, generation, completed.result())
+                try:
+                    result = completed.result()
+                except Exception:
+                    result = InsertionResult("error", "insertion_unavailable")
+                AppHelper.callAfter(self._insertion_ready, generation, result)
             future.add_done_callback(done)
         except Exception:
             self._finish_session(generation, "Не удалось отправить вставку; текст доступен в меню")
@@ -793,12 +906,9 @@ class MenuAppController(NSObject):
         if not self.session.finish(generation, error):
             return
         self._stop_preview_timer()
-        self.ducker.unduck()
         if self.recorder.is_recording:
-            try:
-                self.recorder.stop()
-            except Exception:
-                logger.warning("recording_cleanup_failed session=%s", generation)
+            self.recorder.cancel_capture()
+            self._queue_audio(self._release_audio, generation)
         self.hotkey_listener.reset_state()
         self.engine.reset_preview_cache()
         self.hud.hideHUD()
@@ -808,6 +918,23 @@ class MenuAppController(NSObject):
             self.sounds.play_cancel()
         logger.info("session_finished session=%s status=%s elapsed_ms=%.1f", generation,
                     "error" if error else "event_posted", (time.monotonic() - self.session.started_at) * 1000)
+
+    @objc.python_method
+    def _release_audio(self, generation=0):
+        try:
+            if self.recorder.close() is False:
+                raise ValueError("Не удалось освободить микрофон")
+        finally:
+            self.ducker.unduck()
+
+    @objc.python_method
+    def prepare_meeting_audio(self):
+        future = self._audio_io.submit(self._release_audio)
+        self._audio_future = future
+        try:
+            future.result(timeout=5)
+        except Exception:
+            raise ValueError("Не удалось освободить микрофон. Перезапустите приложение.") from None
 
     def _arm_recovery_expiry(self):
         if self._recovery_timer is not None:
@@ -1016,11 +1143,18 @@ class MenuAppController(NSObject):
         rect = NSRect(NSPoint(0, 0), NSSize(380, 205))
         window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             rect,
-            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSWindowStyleMaskTitled
+            | NSWindowStyleMaskClosable
+            | NSWindowStyleMaskFullSizeContentView,
             NSBackingStoreBuffered,
             False,
         )
         window.setTitle_("Назначение горячей клавиши")
+        window.setTitlebarAppearsTransparent_(True)
+        window.setMovableByWindowBackground_(True)
+        window.setOpaque_(False)
+        window.setBackgroundColor_(NSColor.clearColor())
+        window.setHasShadow_(True)
         window.center()
         window.setLevel_(NSFloatingWindowLevel)
         window.setReleasedWhenClosed_(False)
@@ -1030,12 +1164,20 @@ class MenuAppController(NSObject):
 
         content = window.contentView()
 
+        from .hud import LiveHUDGlassBackdropView
+        backdrop = LiveHUDGlassBackdropView.alloc().initWithFrame_(NSRect(NSPoint(0, 0), NSSize(380, 205)))
+        backdrop.setGlassStyle_("liquid")
+        backdrop.setCornerRadius_(20.0)
+        backdrop.setAutoresizingMask_(18)  # NSViewWidthSizable | NSViewHeightSizable
+        content.addSubview_(backdrop)
+
         # Title
         title_label = NSTextField.alloc().initWithFrame_(
             NSRect(NSPoint(20, 150), NSSize(340, 26))
         )
         title_label.setStringValue_("🎙️ Назначение клавиши записи")
         title_label.setFont_(NSFont.boldSystemFontOfSize_(15.0))
+        title_label.setTextColor_(NSColor.whiteColor())
         title_label.setAlignment_(NSTextAlignmentCenter)
         title_label.setBezeled_(False)
         title_label.setDrawsBackground_(False)
@@ -1049,9 +1191,10 @@ class MenuAppController(NSObject):
         )
         badge.setStringValue_("[ Нажмите любую клавишу ]")
         badge.setFont_(NSFont.boldSystemFontOfSize_(16.0))
+        badge.setTextColor_(NSColor.whiteColor())
         badge.setAlignment_(NSTextAlignmentCenter)
-        badge.setBezeled_(True)
-        badge.setDrawsBackground_(True)
+        badge.setBezeled_(False)
+        badge.setDrawsBackground_(False)
         badge.setEditable_(False)
         badge.setSelectable_(False)
         content.addSubview_(badge)
@@ -1064,7 +1207,7 @@ class MenuAppController(NSObject):
             "Нажмите клавишу на клавиатуре — система сразу зафиксирует её.\n(Для отмены нажмите кнопку ниже или Escape)"
         )
         hint.setFont_(NSFont.systemFontOfSize_(11.0))
-        hint.setTextColor_(NSColor.secondaryLabelColor())
+        hint.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(0.85, 0.9))
         hint.setAlignment_(NSTextAlignmentCenter)
         hint.setBezeled_(False)
         hint.setDrawsBackground_(False)
@@ -1186,7 +1329,7 @@ class MenuAppController(NSObject):
 
     def onSelectGlassStyle_(self, sender):
         style_key = sender.representedObject()
-        if style_key and style_key in ("glass", "balanced", "matte"):
+        if style_key and style_key in ("liquid", "glass", "balanced", "matte"):
             self.config.hud_glass_style = str(style_key)
             self.config.save()
             if hasattr(self.hud, "setGlassStyle_"):
@@ -1202,8 +1345,8 @@ class MenuAppController(NSObject):
     def onToggleAudioDucking_(self, sender):
         self.config.audio_ducking = not getattr(self.config, "audio_ducking", True)
         self.config.save()
-        if not self.config.audio_ducking and self.ducker.is_ducked:
-            self.ducker.unduck()
+        if not self.config.audio_ducking:
+            self._audio_io.submit(self.ducker.unduck)
         self.rebuild_menu()
 
     def onToggleSpace_(self, sender):
@@ -1365,7 +1508,6 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
             return
         logger.info("Restarting application...")
         self._shutdown()
-        from AppKit import NSURL, NSWorkspace
 
         app_url = NSURL.fileURLWithPath_("/Applications/GigaDictate.app")
         if app_url:
@@ -1389,15 +1531,24 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
             ("preview", self._stop_preview_timer),
             ("clipboard", self.inserter.cancel_pending),
             ("hud", self.hud.close),
-            ("volume", self.ducker.unduck),
             ("hotkey", self.hotkey_listener.stop),
-            ("microphone", self.recorder.close),
         ):
             try:
                 cleanup()
             except Exception:
                 logger.warning("shutdown_cleanup_failed component=%s", name)
         self.engine.reset_preview_cache()
+        self.recorder.cancel_capture()
+        self.ducker.detach_exit_handler()
+        future = self._audio_io.submit(self._release_audio)
+        try:
+            future.result(timeout=.2)
+        except Exception:
+            logger.warning("audio_shutdown_pending")
+            # sounddevice's global atexit handler calls Pa_Terminate, which can
+            # wait on the exact native IO already stuck on our daemon worker.
+            self.recorder.detach_exit_handler()
+        self._audio_io.shutdown(wait=False)
         _WORKER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         _PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 

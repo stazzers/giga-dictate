@@ -48,15 +48,19 @@ _kAudioObjectPropertyElementMain = 0
 class AudioDucker:
     """
     Manages temporary attenuation of system output volume during voice dictation.
-    Thread-safe and guaranteed restoration via atexit handlers.
+    Serializes volume changes and restores volume on ordinary shutdown.
     """
 
     def __init__(self):
         self._orig_vol: float | None = None
         self._is_ducked: bool = False
         self._lock = threading.Lock()
-        # Register atexit handler so volume is always restored even on crash or abrupt exit
+        # Fallback for standalone callers. The app uses its audio worker at exit.
         atexit.register(self.unduck)
+
+    def detach_exit_handler(self):
+        """The app queues restoration on its worker; never wait on HAL at exit."""
+        atexit.unregister(self.unduck)
 
     @property
     def is_ducked(self) -> bool:
