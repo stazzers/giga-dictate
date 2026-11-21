@@ -25,11 +25,9 @@ echo "================================================="
 echo " Creating Compact DMG (Big Icons, Pure White BG)"
 echo "================================================="
 
-# 1. Ensure GigaDictate.app is built and valid
-if [ ! -d "$APP_DIR" ]; then
-    echo "GigaDictate.app not found. Building it first..."
-    bash "$DIR/scripts/create_app.sh"
-fi
+# 1. Ensure GigaDictate.app is built and valid (always rebuild to guarantee latest code)
+echo "Building latest GigaDictate.app..."
+bash "$DIR/scripts/create_app.sh"
 
 # Ensure previous volumes are detached
 if [ -d "$VOLUME_PATH" ]; then

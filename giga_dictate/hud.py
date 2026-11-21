@@ -618,7 +618,8 @@ class LiveHUDContainerView(NSView):
     def setLivePreviewEnabled_(self, enabled: bool):
         self.is_preview_enabled = bool(enabled)
         if self.glass_backdrop is not None:
-            self.glass_backdrop.setHidden_(not self.is_preview_enabled)
+            # Liquid Glass capsule is always visible in all display modes
+            self.glass_backdrop.setHidden_(False)
         self.setNeedsDisplay_(True)
 
     def setGlassStyle_(self, style: str):
@@ -714,7 +715,7 @@ class VoiceInputHUD(NSObject):
         self.panel.setLevel_(FLOATING_LEVEL)
         self.panel.setOpaque_(False)
         self.panel.setBackgroundColor_(NSColor.clearColor())
-        self.panel.setHasShadow_(self.live_preview_enabled)
+        self.panel.setHasShadow_(True)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setIgnoresMouseEvents_(True)
         self.panel.setAlphaValue_(0.0)
@@ -872,7 +873,8 @@ class VoiceInputHUD(NSObject):
                 self.container_view.setLivePreviewEnabled_(False)
                 self.container_view.setFrame_(NSRect(NSPoint(0.0, 0.0), NSSize(w, h)))
                 if hasattr(self.container_view, "glass_backdrop") and self.container_view.glass_backdrop is not None:
-                    self.container_view.glass_backdrop.setHidden_(True)
+                    self.container_view.glass_backdrop.setHidden_(False)
+                    self.container_view.glass_backdrop.setFrame_(NSRect(NSPoint(0.0, 0.0), NSSize(w, h)))
                 self.container_view.setNeedsDisplay_(True)
 
             if self.text_label is not None:
@@ -885,7 +887,7 @@ class VoiceInputHUD(NSObject):
                 self.wave_view.setNeedsDisplay_(True)
 
         if self.panel is not None:
-            self.panel.setHasShadow_(self.live_preview_enabled)
+            self.panel.setHasShadow_(True)
             self.panel.invalidateShadow()
             if self._is_visible:
                 if self._anchor_center_x is not None and self._anchor_top_y is not None:
