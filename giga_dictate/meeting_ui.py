@@ -76,6 +76,8 @@ class MeetingUI(NSObject):
         AK.NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
             self, "onSleep:", AK.NSWorkspaceWillSleepNotification, None)
         AK.NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+            self, "onWake:", AK.NSWorkspaceDidWakeNotification, None)
+        AK.NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
             self, "onScreenChange:", AK.NSWorkspaceActiveSpaceDidChangeNotification, None)
         NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
             self, "onScreenChange:", AK.NSApplicationDidChangeScreenParametersNotification, None)
@@ -160,7 +162,11 @@ class MeetingUI(NSObject):
                 return
         index = mic.indexOfSelectedItem()
         device = devices[index - 1][0] if index else None
-        self.session.start(MeetingOptions("online" if online else "room", device, path, speaker_count))
+        try:
+            self.session.start(MeetingOptions("online" if online else "room", device, path, speaker_count))
+        except ValueError as error:
+            self.alert("Не удалось начать встречу", str(error))
+            return
         self.controller.hotkey_listener.reset_state()
         self.controller.rebuild_menu()
 
@@ -204,8 +210,12 @@ class MeetingUI(NSObject):
 
 
     def onSleep_(self, notification):
+        self.controller.discard_microphone_standby()
         if self.session.busy:
             self.session.fail("Mac переходит в сон; встреча завершена. После пробуждения начните новую запись.")
+
+    def onWake_(self, notification):
+        self.controller.schedule_microphone_standby()
 
     def onScreenChange_(self, notification):
         if self.session.busy and self.hud is not None:
@@ -225,6 +235,7 @@ class MeetingUI(NSObject):
             self.controller.update_status_title("")
             self.controller.hotkey_listener.reset_state()
             self.controller.rebuild_menu()
+            self.controller.schedule_microphone_standby()
             if event["cancelled"]:
                 return
             result = event["result"]

@@ -137,6 +137,7 @@ class IsolatedTestCase(unittest.TestCase):
         self.pasteboard = FakePasteboard()
         replacements = {
             "giga_dictate.menu_app.AudioExecutor": ImmediateAudioExecutor,
+            "giga_dictate.menu_app.MicrophoneStandby": MagicMock(),
             "giga_dictate.menu_app.ProcessInputStream": FakeStream,
             "giga_dictate.menu_app._dispatch_audio": lambda callback, *args: callback(*args),
             "giga_dictate.config.CONFIG_DIR": str(root / "config"),

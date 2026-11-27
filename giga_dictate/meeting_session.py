@@ -35,6 +35,7 @@ class MeetingSession:
         self._queued = {}
         self.max_queued_seconds = {}
         self._sources = []
+        self._releasing = {}
         self._failure = ""
         self.started = 0.0
         self.stopped = 0.0
@@ -42,6 +43,14 @@ class MeetingSession:
     @property
     def busy(self):
         return self.state in (MeetingState.PREPARING, MeetingState.RECORDING, MeetingState.FINALIZING)
+
+    @property
+    def microphone_unreleased(self):
+        return not self._source_released("microphone")
+
+    def _source_released(self, name):
+        pending = self._releasing.get(name)
+        return pending is None or pending[1].is_set() or getattr(pending[0], "released", False) is True
 
     @property
     def elapsed(self):
@@ -63,6 +72,8 @@ class MeetingSession:
         options.validate()
         if self.busy:
             return False
+        if self.microphone_unreleased or (options.mode == "online" and not self._source_released("system")):
+            raise ValueError("Аудиоустройство не освободилось. Попробуйте снова или перезапустите приложение.")
         self.generation += 1
         self.options = options
         self.result = None
@@ -80,36 +91,33 @@ class MeetingSession:
         self.worker.start()
         return True
 
-    def _enqueue(self, frame):
-        if self._stop.is_set():
-            return
-        # Non-blocking lock: a capture callback never waits for inference or UI.
-        if not self._condition.acquire(blocking=False):
-            self.fail("Аудиобуфер недоступен; возможен пропуск аудио. Запись завершена.")
-            return
-        overflow = False
-        try:
+    def _enqueue(self, frame, session_id=None):
+        # Only queue bookkeeping shares this lock. Inference and IO run outside it.
+        with self._condition:
+            if (self._closed.is_set() or self._cancel.is_set() or self._failure
+                    or (session_id is not None and session_id != self.generation)):
+                return
             queued = self._queued.get(frame.source, 0.0)
             # Reserve 15 seconds for the VAD/inference phrase (120 s total).
             if queued + frame.duration > 105:
-                overflow = True
-            else:
-                self._queued[frame.source] = queued + frame.duration
-                self.max_queued_seconds[frame.source] = max(
-                    self.max_queued_seconds.get(frame.source, 0), queued + frame.duration)
-                self._frames.append(frame)
-                self._condition.notify()
-        finally:
-            self._condition.release()
-        if overflow:
-            at = max(0, frame.start - self.started)
-            self.fail(f"Очередь переполнена: аудио с {at:.1f} с не обработано; запись завершена.")
+                at = max(0, frame.start - self.started)
+                self.fail(f"Очередь переполнена: аудио с {at:.1f} с не обработано; запись завершена.", session_id)
+                return
+            queued += frame.duration
+            self._queued[frame.source] = queued
+            self.max_queued_seconds[frame.source] = max(self.max_queued_seconds.get(frame.source, 0), queued)
+            self._frames.append(frame)
+            self._condition.notify()
 
-    def fail(self, message):
+    def fail(self, message, session_id=None):
         # Called by capture callbacks; no AppKit, device stop, or file IO here.
-        if not self._failure:
-            self._failure = message
-        self._stop.set()
+        with self._condition:
+            if self._closed.is_set() or (session_id is not None and session_id != self.generation):
+                return
+            if not self._failure:
+                self._failure = message
+            self._stop.set()
+            self._condition.notify()
 
     def stop(self):
         if not self.busy:
@@ -123,24 +131,52 @@ class MeetingSession:
             self.result.clear()
             self.result = None
 
-    def _close_sources(self):
+    def _start_source(self, name, source):
         with self._capture_lock:
-            for source in reversed(self._sources):
-                try:
-                    source.stop()
-                except Exception:
-                    if not self._failure:
-                        self._failure = "Не удалось подтвердить освобождение аудиоустройства"
-            self._sources.clear()
-        self._closed.set()
+            if self._stop.is_set():
+                return
+            self._sources.append((name, source))
+        try:
+            source.start()
+        except Exception:
+            if not self._stop.is_set():
+                raise
+
+    def _close_sources(self, session_id):
+        with self._capture_lock:
+            sources, self._sources = self._sources, []
+
+        def close_source(source, released):
+            try:
+                source.stop()
+            except Exception:
+                return
+            released.set()
+
+        workers = []
+        for name, source in sources:
+            released = threading.Event()
+            self._releasing[name] = source, released
+            worker = threading.Thread(target=close_source, args=(source, released),
+                                      name=f"GigaMeetingStop-{name}", daemon=True)
+            workers.append((name, worker))
+            worker.start()
+        deadline = time.monotonic() + 6
+        for name, worker in workers:
+            worker.join(max(0, deadline - time.monotonic()))
+            if self._source_released(name):
+                self._releasing.pop(name, None)
+            else:
+                self.fail("Не удалось подтвердить освобождение аудиоустройства", session_id)
         with self._condition:
+            self._closed.set()
             self._condition.notify_all()
 
-    def _watch(self):
+    def _watch(self, session_id):
         # Also handles callback failures while the worker is inside GigaAM.
         self._stop.wait()
         self.stopped = self.clock()
-        self._close_sources()
+        self._close_sources(session_id)
 
     def _run(self, session_id):
         result = MeetingResult(session_id, datetime.now().astimezone())
@@ -181,22 +217,25 @@ class MeetingSession:
             self.started = self.clock()
             result.started_at = datetime.now().astimezone()
             normalizers = {name: FrameNormalizer(self.started) for name in sources}
-            watcher = threading.Thread(target=self._watch, name="GigaMeetingCaptureStop", daemon=True)
+            watcher = threading.Thread(target=self._watch, args=(session_id,),
+                                       name="GigaMeetingCaptureStop", daemon=True)
             watcher.start()
-            with self._capture_lock:
-                if not self._stop.is_set():
-                    microphone = self.microphone_factory(self._enqueue, self.fail, self.options.device)
-                    self._sources.append(microphone)
-                    microphone.start()
-                if self.options.mode == "online" and not self._stop.is_set():
-                    if self.system_factory is None:
-                        from .system_audio import SystemAudioStream
-                        factory = SystemAudioStream
-                    else:
-                        factory = self.system_factory
-                    system = factory(self._enqueue, self.fail)
-                    self._sources.append(system)
-                    system.start()
+
+            def emit(frame):
+                self._enqueue(frame, session_id)
+
+            def fail(message):
+                self.fail(message, session_id)
+
+            if not self._stop.is_set():
+                self._start_source("microphone", self.microphone_factory(emit, fail, self.options.device))
+            if online and not self._stop.is_set():
+                if self.system_factory is None:
+                    from .system_audio import SystemAudioStream
+                    factory = SystemAudioStream
+                else:
+                    factory = self.system_factory
+                self._start_source("system", factory(emit, fail))
             if not self._stop.is_set():
                 self._state(MeetingState.RECORDING, session_id)
 
@@ -244,8 +283,6 @@ class MeetingSession:
                 for segment in vads[frame.source].feed(start, pcm):
                     recognize(segment)
             self._stop.set()
-            if watcher:
-                watcher.join(timeout=35)
             if not self._cancel.is_set():
                 for name, normalizer in normalizers.items():
                     start, pcm = normalizer.flush()
@@ -267,9 +304,9 @@ class MeetingSession:
         finally:
             self._stop.set()
             if watcher:
-                watcher.join(timeout=35)
+                watcher.join()
             else:
-                self._close_sources()
+                self._close_sources(session_id)
             self.stopped = self.stopped or self.clock()
             result.duration = self.elapsed
             if diarizer is not None:
@@ -312,8 +349,9 @@ class MeetingSession:
                 except Exception:
                     result.errors.append("Ошибка завершения аудиофайла; файл может быть неполным")
             with self._condition:
-                self._frames.clear()
+                unused_frames, self._frames = self._frames, deque()
                 self._queued.clear()
+            unused_frames.clear()
             vads.clear()
             normalizers.clear()
             cancelled = self._cancel.is_set()

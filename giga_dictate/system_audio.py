@@ -62,8 +62,8 @@ def receiver_class():
 
         def stream_didStopWithError_(self, stream, error):
             owner = self.owner
-            if owner is not None and owner.active:
-                owner.fail("Захват системного звука прерван. Проверьте разрешение записи экрана и звука.")
+            if owner is not None:
+                owner.capture_ended()
 
     _receiver_class = GigaMeetingStreamOutput
     return _receiver_class
@@ -75,6 +75,35 @@ class SystemAudioStream:
         self.stream = self.receiver = None
         self.active = False
         self.sequence = 0
+        self._lock = threading.RLock()
+        self._cancelled = threading.Event()
+        self._started = threading.Event()
+        self._released = threading.Event()
+        self._released.set()
+        self._stop_done = threading.Event()
+        self._stop_requested = False
+
+    @property
+    def released(self):
+        return self._released.is_set()
+
+    def _wait_for_start(self, event):
+        deadline = time.monotonic() + 15
+        while not self._cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if event.wait(min(.05, remaining)):
+                return True
+        return False
+
+    def capture_ended(self):
+        was_active = self.active
+        self.active = False
+        self._released.set()
+        self._stop_done.set()
+        if was_active:
+            self.fail("Захват системного звука прерван. Проверьте разрешение записи экрана и звука.")
 
     def start(self):
         import CoreMedia as CM
@@ -91,7 +120,10 @@ class SystemAudioStream:
             done.set()
 
         SC.SCShareableContent.getShareableContentWithCompletionHandler_(content_ready)
-        if not done.wait(15) or values.get("error") or not values.get("content"):
+        received = self._wait_for_start(done)
+        if self._cancelled.is_set():
+            return
+        if not received or values.get("error") or not values.get("content"):
             raise ValueError("Не удалось получить источники системного звука")
         content = values["content"]
         displays = content.displays()
@@ -110,37 +142,71 @@ class SystemAudioStream:
         config.setHeight_(2)
         config.setMinimumFrameInterval_(CM.CMTimeMake(1, 1))
         config.setShowsCursor_(False)
-        self.receiver = receiver_class().alloc().init()
-        self.receiver.owner = self
-        self.stream = SC.SCStream.alloc().initWithFilter_configuration_delegate_(content_filter, config, self.receiver)
-        ok, error = self.stream.addStreamOutput_type_sampleHandlerQueue_error_(
-            self.receiver, SC.SCStreamOutputTypeAudio, None, None)
-        if not ok:
-            raise ValueError("Не удалось подключить системный аудиопоток")
         before = time.monotonic()
         native_now = CM.CMTimeGetSeconds(CM.CMClockGetTime(CM.CMClockGetHostTimeClock()))
         self.offset = (before + time.monotonic()) / 2 - native_now
-        done.clear()
-        values.clear()
-
         def started(error):
-            values["error"] = error
-            done.set()
+            if error is not None:
+                self.active = False
+                self._released.set()
+            self._started.set()
+            if self._cancelled.is_set():
+                self._request_stop()
 
-        self.active = True
-        self.stream.startCaptureWithCompletionHandler_(started)
-        if not done.wait(15) or values.get("error"):
-            self.stop()
+        with self._lock:
+            if self._cancelled.is_set():
+                return
+            self.receiver = receiver_class().alloc().init()
+            self.receiver.owner = self
+            self.stream = SC.SCStream.alloc().initWithFilter_configuration_delegate_(
+                content_filter, config, self.receiver)
+            ok, _ = self.stream.addStreamOutput_type_sampleHandlerQueue_error_(
+                self.receiver, SC.SCStreamOutputTypeAudio, None, None)
+            if not ok:
+                raise ValueError("Не удалось подключить системный аудиопоток")
+            if self._cancelled.is_set():
+                return
+            self.active = True
+            self._released.clear()
+            try:
+                self.stream.startCaptureWithCompletionHandler_(started)
+            except Exception:
+                # A synchronous exception means no start completion will arrive.
+                self._started.set()
+                raise
+        received = self._wait_for_start(self._started)
+        if not self._cancelled.is_set() and (not received or not self.active):
             raise ValueError("Не удалось начать системную запись. Проверьте разрешения macOS.")
 
+    def _request_stop(self):
+        with self._lock:
+            if self.released or self._stop_requested or not self._started.is_set():
+                return
+            self._stop_requested = True
+            stream = self.stream
+
+        def stopped(error):
+            if error is None:
+                self._released.set()
+            self._stop_done.set()
+
+        try:
+            stream.stopCaptureWithCompletionHandler_(stopped)
+        except Exception:
+            self._stop_done.set()
+
     def stop(self):
+        self._cancelled.set()
         self.active = False
-        stream, self.stream = self.stream, None
-        if stream is not None:
-            done = threading.Event()
-            stream.stopCaptureWithCompletionHandler_(lambda error: done.set())
-            if not done.wait(5):
+        try:
+            # If start is still pending, its completion will issue the stop.
+            self._request_stop()
+            if not self.released and (not self._stop_done.wait(5) or not self.released):
                 raise RuntimeError("Не удалось подтвердить остановку системного аудио")
-        if self.receiver is not None:
-            self.receiver.owner = None
-        self.receiver = None
+        finally:
+            with self._lock:
+                if self.receiver is not None:
+                    self.receiver.owner = None
+                    self.receiver = None
+                if self.released:
+                    self.stream = None

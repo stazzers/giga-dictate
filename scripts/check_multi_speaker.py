@@ -61,13 +61,13 @@ def run_case(pcm, reference, embedder, models, factory, count=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--speaker", type=Path, action="append", required=True,
-                        help="One recording per different voice; repeat 3–15 times")
+                        help="One recording per different voice; repeat 2–15 times")
     parser.add_argument("--baseline-module", type=Path)
     parser.add_argument("--partition", choices=("development", "validation"), default="validation")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if not 3 <= len(args.speaker) <= 15:
-        parser.error("Supply 3–15 different speakers")
+    if not 2 <= len(args.speaker) <= 15:
+        parser.error("Supply 2–15 different speakers")
     audio = [read_pcm(path) for path in args.speaker]
     if any(len(pcm) < 8 * 16000 for pcm in audio):
         parser.error("Every recording must have at least eight seconds")
@@ -80,7 +80,7 @@ def main():
         spec.loader.exec_module(module)
         baseline = module.OnlineDiarizer
     reports = []
-    for count in sorted({3, min(5, len(audio)), min(6, len(audio))}):
+    for count in range(2, min(6, len(audio)) + 1):
         chunks, reference, position = [], [], 0.
 
         def append(pcm, person):

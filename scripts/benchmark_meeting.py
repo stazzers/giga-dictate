@@ -12,6 +12,7 @@ import resource
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from unittest.mock import patch
 import wave
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 def main():
     import gigaam
     import numpy as np
+    import torch
     from giga_dictate.engine import GigaAMEngine
     from giga_dictate.diarization import OnlineDiarizer
     from giga_dictate.meeting_session import MeetingSession
@@ -33,10 +35,16 @@ def main():
     parser.add_argument("--speaker-count", type=int)
     parser.add_argument("--audio", type=Path, default=ROOT / "example.wav")
     parser.add_argument("--device", choices=("mps", "cpu"), default="mps")
+    parser.add_argument("--model", choices=("v3_e2e_ctc", "v3_e2e_rnnt"), default="v3_e2e_ctc")
+    parser.add_argument("--torch-threads", type=int)
+    parser.add_argument("--models", type=Path, help="Verified directory containing the meeting models")
+    parser.add_argument("--reference", type=Path, help="JSON annotations; replay the supplied WAV exactly once")
     parser.add_argument("--output", type=Path, default=ROOT / "build/meeting-benchmark.json")
     args = parser.parse_args()
     if args.seconds < 1:
         parser.error("--seconds must be positive")
+    if args.torch_threads is not None and args.torch_threads < 1:
+        parser.error("--torch-threads must be positive")
     options = MeetingOptions(args.mode, speaker_count=args.speaker_count)
     options.validate()
     refinement = {}
@@ -51,20 +59,25 @@ def main():
             refinement["wall_seconds"] = round(time.monotonic() - started, 4)
             refinement.update(diarizer.refinement_stats)
     cache = Path.home() / ".cache/gigaam"
-    weights, tokenizer = cache / "v3_e2e_ctc.ckpt", cache / "v3_e2e_ctc_tokenizer.model"
+    weights, tokenizer = cache / f"{args.model}.ckpt", cache / f"{args.model}_tokenizer.model"
     if not weights.is_file() or not tokenizer.is_file():
         parser.error("Cached GigaAM weights and tokenizer are required; downloads disabled")
     with wave.open(str(args.audio)) as handle:
         if (handle.getnchannels(), handle.getsampwidth(), handle.getframerate()) != (1, 2, 16000):
             parser.error("Input must be mono PCM16 WAV at 16 kHz")
         sample = np.frombuffer(handle.readframes(handle.getnframes()), "<i2").astype(np.float32) / 32768
+    if not sample.size:
+        parser.error("Input WAV must contain audio")
     logging.basicConfig(level=logging.WARNING)
-    with (patch.object(gigaam, "_download_model", return_value=("v3_e2e_ctc", str(weights))),
+    thread_override = (patch("giga_dictate.engine.torch_threads", return_value=args.torch_threads)
+                       if args.torch_threads is not None else nullcontext())
+    with (patch.object(gigaam, "_download_model", return_value=(args.model, str(weights))),
           patch.object(gigaam, "_download_tokenizer", return_value=str(tokenizer)),
           patch("urllib.request.urlopen", side_effect=RuntimeError("Offline benchmark")),
           patch("socket.create_connection", side_effect=RuntimeError("Offline benchmark")),
-          patch.object(OnlineDiarizer, "refine", autospec=True, side_effect=timed_refine)):
-        engine = GigaAMEngine(device=args.device)
+          patch.object(OnlineDiarizer, "refine", autospec=True, side_effect=timed_refine),
+          thread_override):
+        engine = GigaAMEngine(model_name=args.model, device=args.device)
         if not engine.load():
             raise SystemExit("Could not load cached GigaAM")
         ready, done = threading.Event(), threading.Event()
@@ -86,15 +99,18 @@ def main():
             if event["kind"] == "complete":
                 done.set()
 
+        from giga_dictate.meeting_models import find_models, verify_models
+
         manager = MeetingSession(engine, notify=notify,
             microphone_factory=ReplayCapture, system_factory=ReplayCapture,
+            model_finder=find_models if args.models is None else lambda: verify_models(args.models),
             clock=lambda: timeline[0])
         manager.start(options)
         if not ready.wait(20):
             manager.cancel()
             raise SystemExit("Meeting preparation failed")
         started, cpu = time.monotonic(), time.process_time()
-        total = args.seconds * 16000
+        total = len(sample) if args.reference else args.seconds * 16000
         for sequence, offset in enumerate(range(0, total, 512)):
             if done.is_set():
                 break
@@ -111,10 +127,12 @@ def main():
         while not done.wait(10):
             print("Processing queued speech…", flush=True)
         elapsed = time.monotonic() - started
-        report = {"mode": args.mode, "audio_seconds_per_source": args.seconds,
-                  "device": engine.device_str, "wall_seconds": round(elapsed, 3),
+        audio_seconds = total / 16000
+        report = {"mode": args.mode, "audio_seconds_per_source": audio_seconds,
+                  "model": args.model, "device_requested": args.device, "device": engine.device_str,
+                  "torch_threads": torch.get_num_threads(), "wall_seconds": round(elapsed, 3),
                   "cpu_seconds": round(time.process_time() - cpu, 3),
-                  "real_time_factor": round(elapsed / args.seconds, 4),
+                  "real_time_factor": round(elapsed / audio_seconds, 4),
                   "turn_count": len(manager.result.turns),
                   "speaker_count": len({turn.effective_speaker_id for turn in manager.result.turns
                                         if turn.effective_speaker_id != "unknown"}),
@@ -124,7 +142,15 @@ def main():
                   "error_count": len(manager.result.errors),
                   "refinement": refinement,
                   "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-                  "notes": "Accelerated replay of repeated file audio; no live capture, quality or energy measurement."}
+                  "notes": "Accelerated file replay. Quality metrics require an annotated reference."}
+        if args.reference:
+            from scripts.evaluate_meeting import evaluate
+
+            reference = json.loads(args.reference.read_text())
+            hypothesis = [dict(source=turn.source, start=turn.start, end=turn.end,
+                               speaker_id=turn.effective_speaker_id, text=turn.text)
+                          for turn in manager.result.turns]
+            report["quality"] = evaluate(reference, hypothesis)
         manager.result.clear()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")

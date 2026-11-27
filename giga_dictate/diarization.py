@@ -183,7 +183,8 @@ class OnlineDiarizer:
 
     def _cluster_meeting(self, turns, evidence):
         """Cluster clean turn summaries, retaining rare voices in a bounded pool."""
-        representatives, anchors, masses, metadata = [], [], [], []
+        representatives = np.empty((MAX_REPRESENTATIVES, 192), dtype=np.float32)
+        anchors, masses, metadata = [], [], []
         ordered = sorted(turns, key=lambda turn: (turn.start, turn.id))
         old_keys = list(self.centers)
         manual = {t.manual_speaker_id for t in turns if t.manual_speaker_id is not None}
@@ -191,8 +192,9 @@ class OnlineDiarizer:
         def add(vector, weight, anchor=None, turn=None):
             # Compress only nearly identical observations. Confirmed galleries
             # stay separate until linkage, allowing duplicate speakers to merge.
-            if turn is not None and representatives:
-                similarity = np.stack(representatives) @ vector
+            count = len(masses)
+            if turn is not None and count:
+                similarity = representatives[:count] @ vector
                 choices = [i for i, key in enumerate(anchors) if key is None]
                 best = max(choices, key=lambda i: similarity[i]) if choices else None
                 if best is not None and similarity[best] >= .92:
@@ -206,7 +208,7 @@ class OnlineDiarizer:
                     key = self.resolve_speaker(turn.speaker_id)
                     meta["votes"][key] = meta["votes"].get(key, 0.) + weight
                     return
-            if len(representatives) >= MAX_REPRESENTATIVES:
+            if count == MAX_REPRESENTATIVES:
                 # Prefer repeated voices over isolated outliers; don't evict
                 # gallery anchors. All original summaries remain for assignment.
                 choices = [i for i, key in enumerate(anchors) if key is None]
@@ -214,7 +216,7 @@ class OnlineDiarizer:
                 if metadata[victim]["turns"] > 1:
                     # At saturation compact the most redundant pair instead of
                     # permanently refusing a late, acoustically novel voice.
-                    matrix = np.stack([representatives[i] for i in choices])
+                    matrix = representatives[choices]
                     similarity = matrix @ matrix.T
                     np.fill_diagonal(similarity, -np.inf)
                     a, b = np.unravel_index(int(np.argmax(similarity)), similarity.shape)
@@ -235,7 +237,7 @@ class OnlineDiarizer:
                 metadata[victim] = dict(seconds=weight, turns=1, longest=weight,
                     start=turn.start, turn_id=turn.id, votes={self.resolve_speaker(turn.speaker_id): weight})
                 return
-            representatives.append(vector.copy())
+            representatives[count] = vector
             anchors.append(anchor)
             masses.append(max(weight, .1))
             metadata.append(dict(seconds=weight if turn else 0., turns=int(turn is not None),
@@ -295,13 +297,13 @@ class OnlineDiarizer:
             if any(t.source == "system" for t in turns):
                 raise SpeakerCountError("Указан один голос, но слышна речь в системном канале; сохранены предварительные назначения")
             return
-        if not representatives:
+        if not masses:
             if self.speaker_count:
                 raise SpeakerCountError("Недостаточно независимой речи для указанного количества голосов; сохранены предварительные назначения")
             return
-        groups = average_linkage(np.stack(representatives), masses, threshold=self.cluster_match,
+        groups = average_linkage(representatives[:len(masses)], masses, threshold=self.cluster_match,
                                  count=self.speaker_count, anchors=anchors)
-        self.refinement_stats = {"representatives": len(representatives)}
+        self.refinement_stats = {"representatives": len(masses)}
         if self.speaker_count is None and old_keys:
             # Average-link can isolate a phonetic variant even though a trusted
             # reference recognises it clearly. It is not a new person merely
@@ -312,7 +314,7 @@ class OnlineDiarizer:
                 if any(anchors[i] is not None for i in group):
                     retained.append(group)
                     continue
-                center = unit(np.average([representatives[i] for i in group], axis=0,
+                center = unit(np.average(representatives[group], axis=0,
                                          weights=[masses[i] for i in group]))
                 scores = [max(float(center @ ref) for ref in self.references[key]) for key in old_keys]
                 best = int(np.argmax(scores))
@@ -336,13 +338,13 @@ class OnlineDiarizer:
         while self.speaker_count is not None and len(supported) < self.speaker_count:
             best = None
             for index, group in enumerate(supported):
-                local_vectors = np.stack([representatives[i] for i in group])
+                local_vectors = representatives[group]
                 local_weights = [masses[i] for i in group]
                 split = supported_split(local_vectors, local_weights,
                     lambda indices: has_support([group[i] for i in indices]))
                 if split is not None:
                     partition = [[group[i] for i in indices] for indices in split]
-                    means = [unit(np.average([representatives[i] for i in part], axis=0,
+                    means = [unit(np.average(representatives[part], axis=0,
                                             weights=[masses[i] for i in part])) for part in partition]
                     separation = 1 - float(means[0] @ means[1])
                     if best is None or separation > best[0]:
@@ -387,11 +389,11 @@ class OnlineDiarizer:
                     if sufficient and scores[0] >= self.match and scores[0] - runner >= .15:
                         trusted.append(i)
             chosen = sorted(trusted or group, key=lambda i: -masses[i])
-            refs = [representatives[chosen[0]]]
+            refs = [representatives[chosen[0]].copy()]
             origins = [metadata[chosen[0]]["turn_id"]]
             for i in chosen[1:]:
                 if len(refs) < 8 and max(float(representatives[i] @ ref) for ref in refs) < .9:
-                    refs.append(representatives[i])
+                    refs.append(representatives[i].copy())
                     origins.append(metadata[i]["turn_id"])
             gallery[key] = refs
             gallery_origins[key] = origins
@@ -412,11 +414,12 @@ class OnlineDiarizer:
                                     if not short or origin != turn.id), default=-1.) for key in keys])
             best = int(np.argmax(scores))
             runner = max((s for i, s in enumerate(scores) if i != best), default=0.)
-            short_match = .7 if self.speaker_count is not None else .6
-            threshold = max(short_match, self.match) if evidence[turn.id].speech_seconds < 1. else self.match
+            short_match = .66 if self.speaker_count is not None else .56
+            threshold = max(short_match, self.match) if short else self.match
+            margin = .20 if short else .15
             center_scores = centers @ vector
             center_agrees = self.speaker_count is None or int(np.argmax(center_scores)) == best
-            if scores[best] >= threshold and scores[best] - runner >= .15 and center_agrees:
+            if scores[best] >= threshold and scores[best] - runner >= margin and center_agrees:
                 assignments[turn.id] = keys[best]
             elif self.speaker_count is not None:
                 assignments[turn.id] = "unknown"
@@ -491,16 +494,17 @@ class OnlineDiarizer:
             best = int(np.argmax(totals))
             runner = max((score for i, score in enumerate(totals) if i != best), default=0.0)
             seconds = sum(item.speech_seconds for item in items)
-            # Short speech is noisier. Pool only acoustically consistent replies;
-            # otherwise require a stronger match than for a full phrase.
-            short_match = .7 if self.speaker_count is not None else .6
+            # Short evidence needs a larger lead over the other speaker.
+            # Only acoustically consistent replies can pool their evidence.
+            short_match = .66 if self.speaker_count is not None else .56
             threshold = max(self.new + .12, self.match - .08) if seconds >= 1.0 else max(short_match, self.match)
+            margin = .15 if seconds >= 1.0 else .20
             agreement = np.average(np.argmax(scores, axis=1) == best, weights=weight)
             center_agrees = True
             if self.speaker_count is not None and shared_centers is not None:
                 center_scores = np.average(vectors @ shared_centers.T, axis=0, weights=weight)
                 center_agrees = int(np.argmax(center_scores)) == best
-            if totals[best] < threshold or totals[best] - runner < .15 or agreement < .7 or not center_agrees:
+            if totals[best] < threshold or totals[best] - runner < margin or agreement < .7 or not center_agrees:
                 return "unknown"
             return keys[best]
 

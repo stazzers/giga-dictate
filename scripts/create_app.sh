@@ -3,24 +3,39 @@ set -e
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 APP_NAME="GigaDictate.app"
-APP_DIR="$DIR/$APP_NAME"
+PUBLISH_PATH="$DIR/$APP_NAME"
+PYTHON_RUNTIME="${GIGA_PYTHON_RUNTIME:-$DIR/build/python}"
+SITE_PACKAGES="${GIGA_SITE_PACKAGES:-$DIR/.venv/lib/python3.11/site-packages}"
+GIGAAM_REPO="${GIGA_GIGAAM_REPO:-$DIR/GigaAM_repo}"
+MEETING_MODELS="${GIGA_MEETING_MODELS:-$DIR/build/meeting_models}"
+MIN_MACOS=14.0
+PYTHON="$PYTHON_RUNTIME/bin/python3.11"
+
+cd "$DIR"
+if [ ! -x "$PYTHON" ] || [ ! -f "$PYTHON_RUNTIME/lib/libpython3.11.dylib" ]; then
+    echo "Prepare the portable arm64 CPython runtime with scripts/prepare_macos_python.sh." >&2
+    exit 1
+fi
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SITE_PACKAGES" "$PYTHON" -c \
+    'import platform, sys, ScreenCaptureKit, AVFoundation, CoreMedia, CoreAudio, onnxruntime, kaldi_native_fbank, soxr; from giga_dictate.meeting_models import verify_models; assert platform.machine() == "arm64"; verify_models(sys.argv[1])' \
+    "$MEETING_MODELS"
+
+mkdir -p "$DIR/build"
+STAGE=$(mktemp -d "$DIR/build/.giga-release.XXXXXX")
+APP_DIR="$STAGE/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
-FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
+cleanup() {
+    if [ -d "$STAGE/previous.app" ] && [ ! -e "$PUBLISH_PATH" ]; then
+        mv "$STAGE/previous.app" "$PUBLISH_PATH" || return
+    fi
+    rm -rf "$STAGE"
+}
+trap cleanup EXIT
 
-# Fail before replacing the previous local build if meeting assets are missing.
-cd "$DIR"
-"$DIR/.venv/bin/python" -c 'import ScreenCaptureKit, AVFoundation, CoreMedia, CoreAudio, onnxruntime, kaldi_native_fbank, soxr; from giga_dictate.meeting_models import verify_models; verify_models("build/meeting_models")'
-
-echo "================================================="
-echo " Building Standalone $APP_NAME (Apple Silicon)  "
-echo "================================================="
-
-rm -rf "$APP_DIR"
-mkdir -p "$MACOS_DIR"
-mkdir -p "$RESOURCES_DIR"
-mkdir -p "$FRAMEWORKS_DIR"
+echo "Building standalone $APP_NAME (arm64, macOS $MIN_MACOS or later)"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 # 1. Copy Application Icon
 if [ -f "$DIR/AppIcon.icns" ]; then
@@ -31,8 +46,8 @@ fi
 # 2. Bundle Python Code & Repositories into Resources
 echo "Bundling Python modules into Resources..."
 cp -R "$DIR/giga_dictate" "$RESOURCES_DIR/giga_dictate"
-cp -R "$DIR/GigaAM_repo" "$RESOURCES_DIR/GigaAM_repo"
-cp -R "$DIR/build/meeting_models" "$RESOURCES_DIR/meeting_models"
+cp -R "$GIGAAM_REPO" "$RESOURCES_DIR/GigaAM_repo"
+cp -R "$MEETING_MODELS" "$RESOURCES_DIR/meeting_models"
 # Clean .git, tests, and __pycache__ from bundle
 rm -rf "$RESOURCES_DIR/GigaAM_repo/.git"
 rm -rf "$RESOURCES_DIR/GigaAM_repo/tests"
@@ -41,83 +56,28 @@ rm -rf "$RESOURCES_DIR/GigaAM_repo/docs"
 find "$RESOURCES_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 chmod -R u+w "$APP_DIR"
 
-# 3. Bundle Python.framework into Frameworks (standalone relocatable runtime)
-PYTHON_FW="/opt/homebrew/opt/python@3.11/Frameworks/Python.framework"
-if [ -d "$PYTHON_FW" ]; then
-    echo "Bundling Python.framework into Frameworks..."
-    cp -R "$PYTHON_FW" "$FRAMEWORKS_DIR/Python.framework"
-    # Prune unneeded development headers and test suites to optimize size
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Headers"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/Headers"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/include"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/share"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/test"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/ensurepip"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/idlelib"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/tkinter"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/Resources/Python.app"
-    rm -rf "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/_CodeSignature"
-    rm -f "$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/site-packages"
-
-    # Bundle runtime dylibs that Python depends on so the app runs without Homebrew
-    echo "Bundling standalone runtime dependencies (OpenSSL, SQLite, LZMA, MPDecimal)..."
-    cp -f /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib "$FRAMEWORKS_DIR/"
-    cp -f /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib "$FRAMEWORKS_DIR/"
-    cp -fL /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib "$FRAMEWORKS_DIR/libsqlite3.dylib"
-    cp -fL /opt/homebrew/opt/xz/lib/liblzma.5.dylib "$FRAMEWORKS_DIR/liblzma.5.dylib"
-    cp -fL /opt/homebrew/opt/mpdecimal/lib/libmpdec.4.dylib "$FRAMEWORKS_DIR/libmpdec.4.dylib"
-    chmod 755 "$FRAMEWORKS_DIR"/*.dylib
-
-    install_name_tool -id @rpath/libcrypto.3.dylib "$FRAMEWORKS_DIR/libcrypto.3.dylib"
-    install_name_tool -id @rpath/libssl.3.dylib "$FRAMEWORKS_DIR/libssl.3.dylib"
-    install_name_tool -change /opt/homebrew/Cellar/openssl@3/3.6.4/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$FRAMEWORKS_DIR/libssl.3.dylib" 2>/dev/null || true
-    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$FRAMEWORKS_DIR/libssl.3.dylib" 2>/dev/null || true
-    install_name_tool -id @rpath/libsqlite3.dylib "$FRAMEWORKS_DIR/libsqlite3.dylib"
-    install_name_tool -id @rpath/liblzma.5.dylib "$FRAMEWORKS_DIR/liblzma.5.dylib"
-    install_name_tool -id @rpath/libmpdec.4.dylib "$FRAMEWORKS_DIR/libmpdec.4.dylib"
-
-    DYNLOAD="$FRAMEWORKS_DIR/Python.framework/Versions/3.11/lib/python3.11/lib-dynload"
-    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$DYNLOAD/_hashlib.cpython-311-darwin.so"
-    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib @rpath/libssl.3.dylib "$DYNLOAD/_ssl.cpython-311-darwin.so"
-    install_name_tool -change /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib @rpath/libcrypto.3.dylib "$DYNLOAD/_ssl.cpython-311-darwin.so"
-    install_name_tool -change /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib @rpath/libsqlite3.dylib "$DYNLOAD/_sqlite3.cpython-311-darwin.so"
-    install_name_tool -change /opt/homebrew/opt/xz/lib/liblzma.5.dylib @rpath/liblzma.5.dylib "$DYNLOAD/_lzma.cpython-311-darwin.so"
-    install_name_tool -change /opt/homebrew/opt/mpdecimal/lib/libmpdec.4.dylib @rpath/libmpdec.4.dylib "$DYNLOAD/_decimal.cpython-311-darwin.so"
-
-    # Establish standard macOS framework symlinks for codesign compliance
-    (
-        cd "$FRAMEWORKS_DIR/Python.framework/Versions" && ln -sf 3.11 Current
-        cd "$FRAMEWORKS_DIR/Python.framework" && ln -sf Versions/Current/Python Python
-        cd "$FRAMEWORKS_DIR/Python.framework" && ln -sf Versions/Current/Resources Resources
-    )
-    codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
+# Embed the relocatable runtime, with its own native libraries.
+echo "Bundling portable CPython"
+mkdir -p "$RESOURCES_DIR/PythonRuntime"
+cp -R "$PYTHON_RUNTIME/lib" "$RESOURCES_DIR/PythonRuntime/"
+RUNTIME_LIB="$RESOURCES_DIR/PythonRuntime/lib"
+rm -rf "$RUNTIME_LIB"/python3.11/config-* "$RUNTIME_LIB/pkgconfig" \
+    "$RUNTIME_LIB/python3.11/test" "$RUNTIME_LIB/python3.11/site-packages" \
+    "$RUNTIME_LIB/python3.11/ensurepip" "$RUNTIME_LIB/python3.11/idlelib"
+if [ -f "$PYTHON_RUNTIME/LICENSE.txt" ]; then
+    cp "$PYTHON_RUNTIME/LICENSE.txt" "$RESOURCES_DIR/Python-LICENSE.txt"
 fi
 
-# 4. Bundle Virtualenv site-packages into Resources/venv
-if [ -d "$DIR/.venv" ]; then
-    echo "Bundling dependencies from .venv into Resources/venv..."
-    mkdir -p "$RESOURCES_DIR/venv/lib/python3.11"
-    cp -R "$DIR/.venv/lib/python3.11/site-packages" "$RESOURCES_DIR/venv/lib/python3.11/"
-
-    # Install standalone gigaam package directly into site-packages
-    echo "Installing clean standalone gigaam package into site-packages..."
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/gigaam"
-    cp -R "$DIR/GigaAM_repo/gigaam" "$RESOURCES_DIR/venv/lib/python3.11/site-packages/gigaam"
-
-    # Purge editable links, .pth files, and metadata containing local developer paths
-    echo "Purging editable links and local developer paths..."
-    rm -f "$RESOURCES_DIR/venv/lib/python3.11/site-packages/__editable__"*
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/gigaam-"*.dist-info
-    find "$RESOURCES_DIR/venv/lib/python3.11/site-packages" -name "direct_url.json" -exec rm -f {} +
-
-    # Prune developer headers and unused protoc binary to optimize footprint
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/include"
-    rm -f "$RESOURCES_DIR/venv/lib/python3.11/site-packages/torch/bin/protoc"*
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/pip"*
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/PyObjCTest"*
-    rm -rf "$RESOURCES_DIR/venv/lib/python3.11/site-packages/setuptools"*
-    find "$RESOURCES_DIR/venv" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-fi
+echo "Bundling Python dependencies"
+mkdir -p "$RESOURCES_DIR/venv/lib/python3.11"
+cp -R "$SITE_PACKAGES" "$RESOURCES_DIR/venv/lib/python3.11/site-packages"
+SITE_DEST="$RESOURCES_DIR/venv/lib/python3.11/site-packages"
+rm -rf "$SITE_DEST/gigaam" "$SITE_DEST"/gigaam-*.dist-info "$SITE_DEST"/__editable__* \
+    "$SITE_DEST/torch/include" "$SITE_DEST"/torch/bin/protoc* "$SITE_DEST"/PyObjCTest* \
+    "$SITE_DEST"/pip* "$SITE_DEST"/setuptools*
+cp -R "$GIGAAM_REPO/gigaam" "$SITE_DEST/gigaam"
+find "$SITE_DEST" -name direct_url.json -type f -delete
+find "$CONTENTS_DIR" -name __pycache__ -type d -prune -exec rm -rf {} +
 
 # 5. Create Info.plist with exact permissions
 echo "Generating Info.plist..."
@@ -167,42 +127,36 @@ EOF
 # Standard macOS package signature
 echo -n 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
-# 6. Compile native Mach-O launcher binary linked to @rpath/Python.framework
-echo "Compiling native arm64 Mach-O launcher binary..."
-PY_INC="-I/opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/include/python3.11"
-PY_LIB="-L/opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/config-3.11-darwin -lpython3.11 -ldl -framework CoreFoundation"
+# Compile the launcher and validate every native object before signing.
+echo "Compiling native arm64 launcher"
+xcrun clang -arch arm64 -mmacosx-version-min="$MIN_MACOS" -O2 \
+    -I"$PYTHON_RUNTIME/include/python3.11" \
+    "$PYTHON_RUNTIME/lib/libpython3.11.dylib" -framework CoreFoundation \
+    -Wl,-rpath,@executable_path/../Resources/PythonRuntime/lib \
+    -Wl,-rpath,@executable_path/../Resources/venv/lib/python3.11/site-packages/torch/lib \
+    "$DIR/launcher.c" -o "$MACOS_DIR/GigaDictate"
 
-clang -arch arm64 -O2 $PY_INC \
-  $PY_LIB \
-  -Wl,-rpath,@executable_path/../Frameworks \
-  "$DIR/launcher.c" -o "$MACOS_DIR/GigaDictate"
-
-# Update dylib reference to @rpath so it loads the bundled framework on any Mac
-install_name_tool -change \
-  /opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/Python \
-  @rpath/Python.framework/Versions/3.11/Python \
-  "$MACOS_DIR/GigaDictate"
-
-chmod +x "$MACOS_DIR/GigaDictate"
-
-# 7. Inside-out codesign: sign all Mach-O binaries (.so and .dylib), frameworks, launcher binary, then application bundle
-echo "Codesigning all bundled dynamic libraries and extensions..."
-find "$APP_DIR" -type f \( -name "*.so" -o -name "*.dylib" -o -name "torch_shm_manager" \) -exec codesign -s - --force {} +
-codesign -s - --force --deep "$FRAMEWORKS_DIR/Python.framework"
-codesign -s - --force "$MACOS_DIR/GigaDictate"
+"$PYTHON" "$DIR/scripts/verify_macos_bundle.py" "$APP_DIR" "$MIN_MACOS" \
+    --strip-external-rpaths --signing-list "$STAGE/signing-list"
+while IFS= read -r -d '' binary; do
+    if [ "$binary" != "$MACOS_DIR/GigaDictate" ]; then
+        codesign -s - --force "$binary" 2>"$STAGE/signing-error" || { cat "$STAGE/signing-error" >&2; exit 1; }
+    fi
+done < "$STAGE/signing-list"
 codesign -s - --force --entitlements "$DIR/entitlements.plist" "$APP_DIR"
-codesign -vvv --deep --strict "$APP_DIR"
+codesign --verify --verbose --deep --strict "$APP_DIR"
 
-# 8. Strict verification: ensure zero references to local developer home directory
-echo "Verifying zero developer paths in release bundle..."
-DEV_PATH_MATCHES=$(grep -rnI "/Users/ctazzerc" "$APP_DIR" 2>/dev/null || true)
-if [ -n "$DEV_PATH_MATCHES" ]; then
-    echo "❌ ERROR: Found leftover references to developer directory in $APP_DIR:"
-    echo "$DEV_PATH_MATCHES"
+# Publish only after the staged bundle passes validation and imports its runtime.
+"$MACOS_DIR/GigaDictate" -c 'import ssl, sqlite3, torch, sounddevice, ScreenCaptureKit'
+if [ -n "$HOME" ] && { \
+    if command -v rg >/dev/null; then rg --hidden --no-ignore -l -F -- "$HOME/" "$APP_DIR"
+    else grep -rIlF -- "$HOME/" "$APP_DIR"; fi
+}; then
+    echo "Release contains local home-directory paths." >&2
     exit 1
 fi
-echo "✅ Bundle verified: ZERO references to developer directory."
-
-echo "================================================="
-echo " Standalone bundle built successfully: $APP_DIR"
-echo "================================================="
+if [ -e "$PUBLISH_PATH" ]; then
+    mv "$PUBLISH_PATH" "$STAGE/previous.app"
+fi
+mv "$APP_DIR" "$PUBLISH_PATH"
+echo "Standalone bundle built successfully: $PUBLISH_PATH"

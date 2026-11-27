@@ -2,9 +2,15 @@ import gc
 import logging
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
+
+# Set before importing the backend, including its indirect import by GigaAM.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import gigaam
 import numpy as np
@@ -16,15 +22,23 @@ logger = logging.getLogger("giga_dictate.engine")
 
 _SPACES_RE = re.compile(r"\s+")
 
-# Apple Silicon Metal Performance Shaders (MPS) runtime optimizations
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+@lru_cache(maxsize=1)
+def performance_cores():
+    if sys.platform == "darwin":
+        try:
+            cores = int(subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "hw.perflevel0.physicalcpu"],
+                stderr=subprocess.DEVNULL, timeout=.25,
+            ))
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return os.cpu_count() or 4
 
-# Optimize PyTorch thread pool for Apple Silicon Performance and Efficiency cores
-try:
-    cpu_cores = os.cpu_count() or 4
-    torch.set_num_threads(min(cpu_cores, 8))
-except (RuntimeError, ValueError) as e:
-    logger.debug(f"PyTorch thread count setting error ignored: {e}")
+
+def torch_threads(device):
+    return min(performance_cores(), 4 if device == "mps" else 8)
 
 
 @dataclass
@@ -40,6 +54,7 @@ class GigaAMEngine:
 
     def __init__(self, model_name: str = "v3_e2e_ctc", device: str = "mps"):
         self.model_name = model_name
+        self.requested_device = device
         self.device_str = device
         self.model = None
         self._lock = threading.Lock()
@@ -79,78 +94,59 @@ class GigaAMEngine:
             if model_name:
                 self.model_name = model_name
             if device:
-                self.device_str = device
+                self.requested_device = device
+            self.device_str = self.requested_device
 
-            # Fallback to cpu if mps not available
-            if self.device_str == "mps" and not torch.backends.mps.is_available():
-                logger.warning(
-                    "MPS device requested but not available. Falling back to CPU."
-                )
-                self.device_str = "cpu"
-
-            logger.info(
-                f"Loading GigaAM model '{self.model_name}' on '{self.device_str}'..."
-            )
             self._loaded_event.clear()
             self._is_loaded = False
+            candidates = [self.requested_device]
+            if self.requested_device == "mps":
+                candidates = ["mps", "cpu"] if torch.backends.mps.is_available() else ["cpu"]
+            if candidates[0] != self.requested_device:
+                logger.warning("MPS device requested but not available. Falling back to CPU.")
 
-            # Explicitly release any previously loaded model to avoid doubling RAM/VRAM usage
-            if self.model is not None:
-                old_model = self.model
-                self.model = None
-                del old_model
-                gc.collect()
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-
-            t0 = time.time()
-            try:
-                # fp16_encoder=False is optimal for MPS float32 convs
-                self.model = gigaam.load_model(
-                    self.model_name,
-                    device=self.device_str,
-                    fp16_encoder=False,
-                )
-                self._warmup()
+            for device in candidates:
+                if self.model is not None:
+                    self.model = None
+                    gc.collect()
+                    self._clear_mps_cache()
+                self.device_str = device
+                start = time.monotonic()
+                try:
+                    self._set_threads()
+                    self.model = gigaam.load_model(self.model_name, device=device, fp16_encoder=False)
+                    self._warmup(strict=device == "mps")
+                except Exception as error:
+                    self._load_error = str(error)
+                    logger.warning("asr_load_failed device=%s", device)
+                    continue
                 self._is_loaded = True
                 self._load_error = None
                 self._loaded_event.set()
-                logger.info(
-                    f"Model '{self.model_name}' loaded & warmed up on {self.device_str} in {time.time() - t0:.2f}s"
-                )
+                logger.info("Model '%s' loaded & warmed up on %s in %.2fs",
+                            self.model_name, device, time.monotonic() - start)
                 return True
-            except Exception as e:
-                # If MPS initialization or warmup failed, fallback to CPU
-                if self.device_str == "mps":
-                    logger.warning(
-                        f"Failed to load model on MPS ({e}). Falling back to CPU..."
-                    )
-                    try:
-                        self.device_str = "cpu"
-                        self.model = gigaam.load_model(
-                            self.model_name,
-                            device="cpu",
-                            fp16_encoder=False,
-                        )
-                        self._warmup()
-                        self._is_loaded = True
-                        self._load_error = None
-                        self._loaded_event.set()
-                        logger.info(
-                            f"Model '{self.model_name}' loaded & warmed up on CPU fallback in {time.time() - t0:.2f}s"
-                        )
-                        return True
-                    except Exception as cpu_e:
-                        logger.error(f"CPU fallback also failed: {cpu_e}")
-                self._is_loaded = False
-                self._load_error = str(e)
-                self._loaded_event.set()  # unblock waiters with error
-                logger.error(
-                    f"Failed to load model {self.model_name}: {e}", exc_info=True
-                )
-                return False
+            self.model = None
+            self._loaded_event.set()
+            return False
 
-    def _warmup(self) -> None:
+    @staticmethod
+    def _clear_mps_cache():
+        try:
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except RuntimeError:
+            logger.debug("asr_mps_cache_release_failed")
+
+    def _set_threads(self):
+        try:
+            count = torch_threads(self.device_str)
+            torch.set_num_threads(count)
+            logger.info("asr_thread_pool device=%s threads=%d", self.device_str, count)
+        except (RuntimeError, ValueError):
+            logger.debug("asr_thread_pool_unavailable")
+
+    def _warmup(self, *, strict=False) -> None:
         """Run dummy forward passes to compile MPS shaders and warm up caches for both full and preview slices."""
         if self.model is None:
             return
@@ -171,11 +167,13 @@ class GigaAMEngine:
                 del dummy_audio, wav, length, encoded, encoded_len
                 dummy_audio = wav = length = encoded = encoded_len = None
         except Exception as e:
+            if strict:
+                raise
             logger.warning(f"Warmup pass warning: {e}")
         finally:
             del dummy_audio, wav, length, encoded, encoded_len
-            if self.device_str == "mps" and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            if self.device_str == "mps":
+                self._clear_mps_cache()
 
     @torch.inference_mode()
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
@@ -210,37 +208,9 @@ class GigaAMEngine:
                 if len(chunk) < int(0.2 * sample_rate):
                     continue
 
-                wav = None
-                length = None
-                encoded = None
-                encoded_len = None
-                try:
-                    wav = torch.as_tensor(
-                        chunk,
-                        dtype=self.model._dtype,
-                        device=self.model._device,
-                    ).unsqueeze(0)
-                    length = torch.full(
-                        [1], wav.shape[-1], device=self.model._device
-                    )
-
-                    encoded, encoded_len = self.model.forward(wav, length)
-                    decoded = self.model._decode(
-                        encoded, encoded_len, length, word_timestamps=False
-                    )
-                    if decoded and len(decoded) > 0 and decoded[0] is not None:
-                        first = decoded[0]
-                        raw = (
-                            first[0]
-                            if isinstance(first, (list, tuple)) and len(first) > 0
-                            else first
-                        )
-                        if isinstance(raw, str):
-                            text = _SPACES_RE.sub(" ", raw.replace("⁇", "").replace("\ufffd", "")).strip()
-                            if text:
-                                results.append(text)
-                finally:
-                    del wav, length, encoded, encoded_len
+                text = self._decode_with_fallback(chunk)
+                if text:
+                    results.append(text)
 
         full_text = " ".join(results)
         # Normalize repeated spaces
@@ -311,22 +281,35 @@ class GigaAMEngine:
             self._last_preview_len = cache.offset + cache.last_size
             self._last_preview_text = text
             return text
-        except Exception as error:
+        except Exception:
             logger.debug("preview_decode_failed")
-            if self.device_str == "mps" and ("mps" in str(error).lower() or "metal" in str(error).lower()):
-                logger.warning("preview_mps_failed fallback=cpu")
-                try:
-                    self.model.to("cpu")
-                    self.model._device = torch.device("cpu")
-                    self.device_str = "cpu"
-                    self.reset_preview_cache()
-                except Exception:
-                    logger.warning("preview_cpu_fallback_failed")
             return ""
         finally:
             self._lock.release()
 
     def _decode_preview_chunk(self, audio):
+        return self._decode_with_fallback(audio, preview=True)
+
+    def _decode_with_fallback(self, audio, *, preview=False):
+        try:
+            return self._decode_chunk(audio, preview=preview)
+        except RuntimeError as error:
+            message = str(error).lower()
+            if self.device_str != "mps" or ("mps" not in message and "metal" not in message):
+                raise
+        logger.warning("asr_mps_failed fallback=cpu")
+        try:
+            self.model.to("cpu")
+        except Exception:
+            self._is_loaded = False
+            self._load_error = "Не удалось перенести GigaAM на CPU"
+            raise
+        self.device_str = "cpu"
+        self._clear_mps_cache()
+        self._set_threads()
+        return self._decode_chunk(audio, preview=preview)
+
+    def _decode_chunk(self, audio, *, preview):
         wav = torch.as_tensor(audio, dtype=self.model._dtype, device=self.model._device).unsqueeze(0)
         length = torch.full([1], wav.shape[-1], device=self.model._device)
         encoded, encoded_len = self.model.forward(wav, length)
@@ -335,6 +318,6 @@ class GigaAMEngine:
             return ""
         first = decoded[0]
         raw = first[0] if isinstance(first, (list, tuple)) and first else first
-        if not isinstance(raw, str) or raw.strip().startswith(("⁇", "\ufffd")):
+        if not isinstance(raw, str) or (preview and raw.strip().startswith(("⁇", "\ufffd"))):
             return ""
         return _SPACES_RE.sub(" ", raw.replace("⁇", "").replace("\ufffd", "")).strip()

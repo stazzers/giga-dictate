@@ -1,11 +1,13 @@
 """Real pipe/process lifetime regressions; the worker never opens a microphone."""
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from giga_dictate.audio import AudioRecorder
-from giga_dictate.process_audio import ProcessInputStream, worker_command
+from giga_dictate.process_audio import MicrophoneStandby, ProcessInputStream, worker_command
 
 
 WORKER = r'''
@@ -26,11 +28,13 @@ if mode == 'malformed':
 if mode == 'unkillable_stop':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 send(2)
-send(1, struct.pack('<f', .1) * 512)
+if mode != 'no_pcm':
+    send(1, struct.pack('<f', .1) * 512)
 sys.stdin.buffer.readline()
 # A final callback is in flight when STOP is received. It must be captured
 # before the DRAINED FIFO marker, even if native shutdown never returns.
-send(1, struct.pack('<f', .2) * 256)
+if mode != 'no_pcm':
+    send(1, struct.pack('<f', .2) * 256)
 send(3)
 if mode in ('stop_hang', 'unkillable_stop'):
     time.sleep(30)
@@ -38,20 +42,25 @@ send(4)
 '''
 
 NATIVE_WORKER_WITH_FAKE_DEVICE = r'''
-import sys, types, time
-import numpy as np
+import struct, sys, types, time
 class Stream:
+    time = 100.0
     def __init__(self, callback, **kwargs):
         self.callback = callback
         if sys.argv[1] == 'open_hang':
             time.sleep(30)
     def start(self):
-        self.callback(np.full((512, 1), .1, np.float32), 512, None, None)
+        data = memoryview(struct.pack('<f', .1) * 512)
+        timing = types.SimpleNamespace(inputBufferAdcTime=99.968)
+        self.callback(data, 512, timing, None)
+        if sys.argv[1] == 'timed':
+            self.callback(data, 512, types.SimpleNamespace(inputBufferAdcTime=100.0), None)
     def abort(self):
         time.sleep(30)
     def close(self):
         pass
-sys.modules['sounddevice'] = types.SimpleNamespace(InputStream=Stream)
+sys.modules['sounddevice'] = types.SimpleNamespace(
+    RawInputStream=Stream, query_devices=lambda *args: {'default_samplerate': 48000})
 from giga_dictate.audio_worker import main
 main()
 '''
@@ -91,13 +100,71 @@ class ProcessCapture(unittest.TestCase):
         stream.close()  # idempotent, with no second native stop
 
     def test_startup_hang_or_bad_protocol_leaves_no_capture_process(self):
-        for mode in ("start_hang", "early_exit", "malformed"):
+        for mode in ("start_hang", "early_exit", "malformed", "no_pcm"):
             with self.subTest(mode=mode):
                 stream = self.stream(mode)
                 with self.assertRaises(RuntimeError):
                     stream.start()
                 self.assertTrue(stream.closed)
                 self.assertIsNotNone(stream._process.poll())
+
+    def test_meeting_ipc_preserves_native_rate_sequence_and_capture_clock(self):
+        frames = []
+        command = [worker_command()[0], "-u", "-c", NATIVE_WORKER_WITH_FAKE_DEVICE, "timed"]
+        stream = ProcessInputStream(samplerate=None, blocksize=None, channels=1, dtype="float32",
+            device=None, timed=True, callback=lambda *frame: frames.append(frame), command=command)
+        self.addCleanup(stream.close)
+        before = time.monotonic()
+        stream.start()
+        after = time.monotonic()
+        stream.finish_capture()
+        self.assertEqual([(frame[1], frame[2]) for frame in frames], [(0, 48000), (1, 48000)])
+        self.assertLessEqual(before - .032, frames[0][3])
+        self.assertLessEqual(frames[0][3], after - .032)
+        self.assertAlmostEqual(frames[1][3] - frames[0][3], .032, places=6)
+        np.testing.assert_array_equal(frames[0][0].ravel(), np.full(512, .1, np.float32))
+
+    def test_stopping_during_process_open_unblocks_start(self):
+        stream = self.stream("start_hang")
+        stream.start_timeout = 10
+        finished = threading.Event()
+
+        def start():
+            try:
+                stream.start()
+            except RuntimeError:
+                finished.set()
+
+        thread = threading.Thread(target=start, daemon=True)
+        thread.start()
+        timeout = time.monotonic() + 1
+        while stream._reader is None and time.monotonic() < timeout:
+            time.sleep(.005)
+        self.assertIsNotNone(stream._reader)
+        stream.close()
+        self.assertTrue(finished.wait(1))
+        self.assertIsNotNone(stream._process.poll())
+
+    def test_standby_uses_one_child_then_releases_it_and_prepares_a_fresh_one(self):
+        standby = MicrophoneStandby()
+        self.addCleanup(standby.clear)
+        command = [worker_command()[0], "-u", "-c", WORKER, "normal"]
+        with patch("giga_dictate.process_audio.worker_command", return_value=command):
+            standby.prepare()
+            first = standby.process
+            standby.prepare()
+            self.assertIs(first, standby.process)
+            stream = self.stream("normal")
+            stream.standby = standby
+            stream.start()
+            self.assertIs(stream._process, first)
+            self.assertIsNone(standby.process)
+            stream.close()
+            standby.prepare()
+            second = standby.process
+        self.assertIsNot(first, second)
+        standby.clear()
+        self.assertIsNotNone(second.poll())
 
     def test_recording_result_is_detached_and_next_dictation_gets_fresh_child(self):
         streams = []

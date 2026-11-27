@@ -55,8 +55,19 @@ class DictationCaptureRegression(unittest.TestCase):
         device = AudioDevice()
         recorder = AudioRecorder()
         self.addCleanup(recorder.close)
+
+        class MeetingInput:
+            def __init__(self, callback, **kwargs):
+                self.stream = device.open(lambda pcm, *_: callback(pcm, 0, 48000, 100.0))
+
+            def start(self):
+                self.stream.start()
+
+            def close(self):
+                self.stream.close()
+
         with patch("giga_dictate.audio.sd.InputStream", side_effect=device.open), \
-             patch("sounddevice.query_devices", return_value={"default_samplerate": 48000}):
+             patch("giga_dictate.meeting_audio.ProcessInputStream", MeetingInput):
             self.assertTrue(recorder.start())
             first, _ = recorder.stop()
             # The production meeting handoff runs this full close on the audio
@@ -67,6 +78,7 @@ class DictationCaptureRegression(unittest.TestCase):
             meeting.start()
             meeting.stop()
             self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0].sample_rate, 48000)
             self.assertEqual(errors, [])
             self.assertTrue(recorder.start())
             after_meeting, duration = recorder.stop()

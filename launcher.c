@@ -39,12 +39,9 @@ int main(int argc, char *argv[]) {
     char resources_dir[PATH_MAX];
     snprintf(resources_dir, sizeof(resources_dir), "%s/Resources", contents_dir);
 
-    char frameworks_dir[PATH_MAX];
-    snprintf(frameworks_dir, sizeof(frameworks_dir), "%s/Frameworks", contents_dir);
-
     // 3. Check if standalone bundled Python & venv exist inside the application bundle
     char bundled_py_home[PATH_MAX];
-    snprintf(bundled_py_home, sizeof(bundled_py_home), "%s/Python.framework/Versions/3.11", frameworks_dir);
+    snprintf(bundled_py_home, sizeof(bundled_py_home), "%s/PythonRuntime", resources_dir);
 
     char bundled_site[PATH_MAX];
     snprintf(bundled_site, sizeof(bundled_site), "%s/venv/lib/python3.11/site-packages", resources_dir);

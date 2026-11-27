@@ -67,6 +67,16 @@ class SpeakerStability(unittest.TestCase):
         diarizer.refine([one, two], {1: self.evidence(moderate, .7), 2: self.evidence(moderate, .7)})
         self.assertEqual([one.speaker_id, two.speaker_id], [first, first])
 
+    def test_short_reply_matches_only_with_a_clear_lead(self):
+        diarizer = OnlineDiarizer(lambda pcm: vector())
+        first, _ = self.confirm_two(diarizer)
+        match = vector() * .58 + vector(2) * np.sqrt(1 - .58 ** 2)
+        ambiguous = vector() * .61 + vector(1) * .45 + vector(3) * np.sqrt(1 - .61 ** 2 - .45 ** 2)
+        turns = [TranscriptTurn(1, 0, .8, "microphone", "unknown", ""),
+                 TranscriptTurn(2, 4, 4.8, "microphone", "unknown", "")]
+        diarizer.refine(turns, {1: self.evidence(match, .8), 2: self.evidence(ambiguous, .8)})
+        self.assertEqual([turn.speaker_id for turn in turns], [first, "unknown"])
+
     def test_no_assignment_from_neighbours_without_acoustic_evidence(self):
         diarizer = OnlineDiarizer(lambda pcm: vector())
         first, second = self.confirm_two(diarizer)

@@ -208,6 +208,7 @@ cd giga-dictate
 # После подготовки основного окружения GigaAM/PyTorch:
 .venv/bin/python -m pip install -r requirements-meeting.txt
 .venv/bin/python scripts/prepare_meeting_models.py
+bash scripts/prepare_macos_python.sh
 bash scripts/create_app.sh
 ./run.sh
 ```

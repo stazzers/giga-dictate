@@ -256,6 +256,29 @@ class TestIncrementalPreview(IsolatedTestCase):
         self.assertEqual(engine.preview_offset, committed)
         self.assertTrue(all(c.args[0].shape[-1] <= 20 * 16000 for c in engine.model.forward.call_args_list))
 
+    def test_mps_final_fallback_retries_only_failed_chunk(self):
+        engine = self.make_engine()
+        engine.device_str = engine.requested_device = "mps"
+        first, second = np.ones(16000, dtype=np.float32), np.zeros(16000, dtype=np.float32)
+        with patch("giga_dictate.engine.split_audio_into_chunks", return_value=[first, second]), \
+             patch.object(engine, "_decode_chunk", side_effect=["первый", RuntimeError("MPS error"), "второй"]) as decode, \
+             patch.object(engine, "_set_threads"):
+            self.assertEqual(engine.transcribe(np.ones(21 * 16000, dtype=np.float32)), "первый второй")
+        engine.model.to.assert_called_once_with("cpu")
+        self.assertIs(decode.call_args_list[0].args[0], first)
+        self.assertIs(decode.call_args_list[1].args[0], second)
+        self.assertIs(decode.call_args_list[2].args[0], second)
+        self.assertEqual((engine.requested_device, engine.device_str), ("mps", "cpu"))
+
+    def test_mps_preview_moves_model_without_setting_readonly_device(self):
+        engine = self.make_engine()
+        engine.device_str = engine.requested_device = "mps"
+        engine.model = torch.nn.Linear(1, 1)
+        with patch.object(engine, "_decode_chunk", side_effect=[RuntimeError("Metal error"), "готово"]), \
+             patch.object(engine, "_set_threads"):
+            self.assertEqual(engine.transcribe_preview(np.ones(16000, dtype=np.float32)), "готово")
+        self.assertEqual(engine.device_str, "cpu")
+
     def test_offset_input_matches_full_input_and_discards_old_offset(self):
         full_engine, tail_engine = self.make_engine(), self.make_engine()
         audio = np.ones(45 * 16000, dtype=np.float32)

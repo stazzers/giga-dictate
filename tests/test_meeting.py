@@ -315,6 +315,70 @@ class MeetingLifecycle(unittest.TestCase):
         self.assertEqual(second.session_id, first.session_id + 1)
         self.assertEqual(len(second.turns), 1)
 
+    def test_system_stops_while_microphone_stop_is_blocked(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        class SlowMicrophone(Capture):
+            def stop(self):
+                entered.set()
+                release.wait(3)
+                super().stop()
+
+        system = Capture(None, None)
+        self.manager.microphone_factory = SlowMicrophone
+        self.manager.system_factory = lambda *args: system
+        self.start("online")
+        self.manager.stop()
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(system.closed.wait(1))
+        self.assertFalse(self.complete.is_set())
+        release.set()
+        self.assertTrue(self.complete.wait(3))
+        self.assertFalse(self.manager.microphone_unreleased)
+
+    def test_stop_interrupts_preparing_source_and_rejects_its_late_frames(self):
+        entered = threading.Event()
+
+        class PreparingSystem(Capture):
+            def start(self):
+                entered.set()
+                self.closed.wait(3)
+
+        self.manager.system_factory = PreparingSystem
+        self.assertTrue(self.manager.start(MeetingOptions("online")))
+        self.assertTrue(entered.wait(2))
+        old_microphone = self.captures[0]
+        self.manager.stop()
+        self.assertTrue(self.complete.wait(2))
+        self.assertTrue(old_microphone.closed.is_set())
+        self.complete.clear()
+        self.start()
+        old_microphone.emit(AudioFrame("microphone", 0, self.manager.started, 16000,
+                                       np.full(32000, .1, np.float32)))
+        old_microphone.fail("Устаревший сбой")
+        result = self.finish()
+        self.assertFalse(result.turns)
+        self.assertFalse(result.errors)
+
+    def test_queue_contention_does_not_cancel_capture(self):
+        self.start()
+        entered = threading.Event()
+
+        def feed():
+            entered.set()
+            self.feed()
+
+        thread = threading.Thread(target=feed)
+        with self.manager._condition:
+            thread.start()
+            self.assertTrue(entered.wait(1))
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        result = self.finish()
+        self.assertTrue(result.turns)
+        self.assertFalse(result.errors)
+
     def test_online_sources_remain_separate_and_overlap(self):
         self.start("online")
         self.feed("microphone")
@@ -554,6 +618,20 @@ class MeetingModelIntegrity(unittest.TestCase):
 
 
 class CoreMediaDecode(unittest.TestCase):
+    def test_system_capture_does_not_claim_release_on_native_stop_error(self):
+        from giga_dictate.system_audio import SystemAudioStream
+
+        capture = SystemAudioStream(Mock(), Mock())
+        capture._released.clear()
+        capture._started.set()
+        capture.receiver = Mock(owner=capture)
+        capture.stream = Mock()
+        capture.stream.stopCaptureWithCompletionHandler_.side_effect = lambda callback: callback("stop error")
+        with self.assertRaisesRegex(RuntimeError, "Не удалось подтвердить"):
+            capture.stop()
+        self.assertFalse(capture.released)
+        self.assertIsNone(capture.receiver)
+
     def test_interleaved_and_planar_buffers_keep_timestamp(self):
         import CoreMedia as CM
         import CoreAudio as CA

@@ -69,7 +69,7 @@ from .hotkey import (
 )
 from .hud import VoiceInputHUD
 from .inserter import InsertionResult, TextInserter
-from .process_audio import ProcessInputStream
+from .process_audio import MicrophoneStandby, ProcessInputStream
 from .session import DictationSession, DictationState, RecoveryText
 from .sounds import SoundManager
 
@@ -178,7 +178,8 @@ class MenuAppController(NSObject):
         self.config = AppConfig.load()
         remove_legacy_voice_profile()
         self.sounds = SoundManager(enabled=self.config.sound_feedback)
-        self.recorder = AudioRecorder(device=self.config.audio_device, stream_factory=ProcessInputStream)
+        self._microphone_standby = MicrophoneStandby()
+        self.recorder = AudioRecorder(device=self.config.audio_device, stream_factory=self._dictation_input)
         self.engine = GigaAMEngine(
             model_name=self.config.model_name,
             device=self.config.device,
@@ -188,6 +189,7 @@ class MenuAppController(NSObject):
         self._audio_io = AudioExecutor()
         self._audio_future = None
         self._audio_unavailable = False
+        self._audio_ready_generation = None
         self._captured_audio_generation = None
         from .meeting_ui import MeetingUI
         self.meeting_ui = MeetingUI.alloc().initWithController_(self)
@@ -329,8 +331,10 @@ class MenuAppController(NSObject):
         self._model_reloading = False
         self._model_error = None
         self._model_progress_str = ""
-        self.update_status_title("", recording=self.session.state == DictationState.RECORDING)
+        self.update_status_title("", recording=self.session.state == DictationState.RECORDING
+                                 and self._audio_ready_generation == self.session.generation)
         self.rebuild_menu()
+        self.schedule_microphone_standby()
         logger.info("Ready for dictation.")
 
     def onModelError_(self, error_str):
@@ -376,7 +380,8 @@ class MenuAppController(NSObject):
                     btn.setImage_(self.menu_icon)
                 btn.setImagePosition_(NSImageOnly)
                 btn.setTitle_("")
-            btn.setToolTip_(self.session.error if self.session.state == DictationState.ERROR else "GigaDictate — Голосовой ввод GigaAM-v3")
+            tooltip = self.session.error if self.session.state == DictationState.ERROR else title
+            btn.setToolTip_(tooltip or "GigaDictate — Голосовой ввод GigaAM-v3")
             self.status_item.setVisible_(True)
 
     def rebuild_menu(self):
@@ -394,7 +399,8 @@ class MenuAppController(NSObject):
         elif self.session.state == DictationState.ERROR:
             status_text = f"⚠️ {self.session.error}"
         elif self.session.state == DictationState.RECORDING:
-            status_text = "🔴 Идет запись голоса..."
+            status_text = ("🔴 Идет запись голоса…" if self._audio_ready_generation == self.session.generation
+                           else "⏳ Включение микрофона…")
         elif self._model_error:
             status_text = f"⚠️ Ошибка: {self._model_error[:40]}"
         elif not self.engine.is_loaded:
@@ -659,10 +665,11 @@ class MenuAppController(NSObject):
 
     def on_hotkey_start(self):
         """Called by hotkey listener."""
+        requested_at = time.monotonic()
         if NSThread.isMainThread():
-            self.start_recording()
+            self.start_recording(requested_at=requested_at)
         else:
-            AppHelper.callAfter(self.start_recording)
+            AppHelper.callAfter(self.start_recording, False, requested_at)
 
     def on_hotkey_stop(self):
         """Called by hotkey listener."""
@@ -671,12 +678,19 @@ class MenuAppController(NSObject):
         else:
             AppHelper.callAfter(self.stop_and_transcribe)
 
-    def start_recording(self, manual: bool = False):
+    def start_recording(self, manual: bool = False, requested_at=None):
+        if requested_at is None:
+            requested_at = time.monotonic()
         if self.audio_busy:
             self.hotkey_listener.reset_state()
             return
         if self._meeting_busy():
             self.hotkey_listener.reset_state()
+            return
+        meeting = getattr(self, "meeting_ui", None)
+        if getattr(getattr(meeting, "session", None), "microphone_unreleased", False) is True:
+            self.hotkey_listener.reset_state()
+            self.update_status_title("Микрофон ещё не освободился")
             return
         if self._model_reloading:
             self.hotkey_listener.reset_state()
@@ -688,15 +702,16 @@ class MenuAppController(NSObject):
             if self.session.state != DictationState.RECORDING:
                 self.hotkey_listener.reset_state()
             return
+        self.session.started_at = requested_at
         generation = self.session.generation
         try:
             self.hotkey_listener.set_recording(True)
             self._preview_session_id += 1
             self.engine.reset_preview_cache()
-            self.update_status_title("Включение микрофона...", recording=True)
+            self.update_status_title("Включение микрофона…")
+            self._queue_audio(self._start_audio, generation, self._audio_started)
             self.hud.showRecording()
             self.update_menu_status()
-            self._queue_audio(self._start_audio, generation, self._audio_started)
         except Exception:
             logger.warning("recording_start_failed session=%s", generation)
             self._finish_session(generation, "Ошибка запуска записи")
@@ -705,6 +720,7 @@ class MenuAppController(NSObject):
         if self.session.state != DictationState.RECORDING:
             return
         generation = self.session.generation
+        logger.info("dictation_stop_requested session=%s monotonic=%.6f", generation, time.monotonic())
         self.session.state = DictationState.TRANSCRIBING
         self._preview_session_id += 1
         self._stop_preview_timer()
@@ -762,17 +778,25 @@ class MenuAppController(NSObject):
 
     @objc.python_method
     def _start_audio(self, generation):
+        dequeued_at = time.monotonic()
         logger.info("audio_start_begin session=%s", generation)
         try:
             # Change output volume before input IO starts, not while HAL is busy.
             if self.config.audio_ducking:
                 self.ducker.duck(target_volume=self.config.ducking_volume)
+            ducked_at = time.monotonic()
             if self._shutting_down or not self.session.accepts(generation) or not self.session.busy:
                 self._release_audio()
                 return False
             if not self.recorder.start():
                 self.ducker.unduck()
                 return False
+            first_pcm_at = self.recorder.first_pcm_at
+            if isinstance(first_pcm_at, float):
+                logger.info("dictation_first_pcm session=%s queue_ms=%.1f duck_ms=%.1f total_ms=%.1f",
+                            generation, (dequeued_at - self.session.started_at) * 1000,
+                            (ducked_at - dequeued_at) * 1000,
+                            (first_pcm_at - self.session.started_at) * 1000)
             # A watchdog may have cancelled the session while CoreAudio was
             # opening. Release that late stream on this same worker.
             if self._shutting_down or not self.session.accepts(generation) or not self.session.busy:
@@ -790,6 +814,7 @@ class MenuAppController(NSObject):
         if not success:
             self._finish_session(generation, "Не удалось включить микрофон")
             return
+        self._audio_ready_generation = generation
         self.update_status_title("Запись...", recording=True)
         self.sounds.play_start()
         if self.config.live_hud_preview:
@@ -916,6 +941,7 @@ class MenuAppController(NSObject):
         self.update_menu_status()
         if error:
             self.sounds.play_cancel()
+        self.schedule_microphone_standby()
         logger.info("session_finished session=%s status=%s elapsed_ms=%.1f", generation,
                     "error" if error else "event_posted", (time.monotonic() - self.session.started_at) * 1000)
 
@@ -928,8 +954,33 @@ class MenuAppController(NSObject):
             self.ducker.unduck()
 
     @objc.python_method
+    def _dictation_input(self, **config):
+        return ProcessInputStream(**config, standby=self._microphone_standby)
+
+    @objc.python_method
+    def schedule_microphone_standby(self):
+        if not self._shutting_down:
+            self._audio_io.submit(self._prepare_microphone_standby)
+
+    @objc.python_method
+    def _prepare_microphone_standby(self):
+        if not self._shutting_down and not self.session.busy and not self._meeting_busy() and self.engine.is_loaded:
+            self._microphone_standby.prepare()
+
+    @objc.python_method
+    def discard_microphone_standby(self):
+        self._audio_io.submit(self._microphone_standby.clear)
+
+    @objc.python_method
+    def _release_capture(self):
+        try:
+            self._microphone_standby.clear()
+        finally:
+            self._release_audio()
+
+    @objc.python_method
     def prepare_meeting_audio(self):
-        future = self._audio_io.submit(self._release_audio)
+        future = self._audio_io.submit(self._release_capture)
         self._audio_future = future
         try:
             future.result(timeout=5)
@@ -1540,7 +1591,7 @@ rm -f "$HOME/Library/Application Support/CrashReporter/GigaDictate"* 2>/dev/null
         self.engine.reset_preview_cache()
         self.recorder.cancel_capture()
         self.ducker.detach_exit_handler()
-        future = self._audio_io.submit(self._release_audio)
+        future = self._audio_io.submit(self._release_capture)
         try:
             future.result(timeout=.2)
         except Exception:

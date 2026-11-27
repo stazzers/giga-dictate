@@ -1,60 +1,26 @@
 """Bounded microphone capture, native audio clocks, and streaming resampling."""
-import threading
-import time
-
 import numpy as np
 
 from .meeting_types import AudioFrame
+from .process_audio import ProcessInputStream
 
 
 class MicrophoneStream:
     def __init__(self, emit, fail, device=None):
-        self.emit, self.fail, self.device = emit, fail, device
-        self.stream = None
-        self.sequence = 0
-        self.clock_offset = 0.0
-        self.ready = threading.Event()
+        def on_pcm(pcm, sequence, rate, timestamp):
+            emit(AudioFrame("microphone", sequence, timestamp, rate, pcm))
+
+        self.stream = ProcessInputStream(device=device, samplerate=None, blocksize=None, channels=1,
+                                         dtype="float32", timed=True, callback=on_pcm, on_failure=fail)
 
     def start(self):
-        import sounddevice as sd
-        rate = int(sd.query_devices(self.device, "input")["default_samplerate"])
-        self.sample_rate = rate
-        self.stream = sd.InputStream(
-            device=self.device, samplerate=rate, channels=1, dtype="float32",
-            blocksize=max(256, int(rate * .032)), callback=self._callback,
-            finished_callback=self._finished,
-        )
-        # PortAudio's currentTime and inputBufferAdcTime share a device clock.
-        before = time.monotonic()
-        native_now = self.stream.time
-        after = time.monotonic()
-        self.clock_offset = (before + after) / 2 - native_now
-        self.ready.set()
-        self.stream.start()
-
-    def _callback(self, data, frames, timing, status):
-        if not self.ready.is_set():
-            return
-        if status:
-            self.fail("Микрофон сообщил о потере аудио; запись завершена")
-            return
-        self.emit(AudioFrame("microphone", self.sequence,
-                             timing.inputBufferAdcTime + self.clock_offset,
-                             self.sample_rate, data.copy()))
-        self.sequence += 1
-
-    def _finished(self):
-        if self.ready.is_set():
-            self.fail("Микрофон отключён; запись завершена")
+        try:
+            self.stream.start()
+        except RuntimeError:
+            raise ValueError("Микрофон не передал звук. Проверьте устройство и разрешение macOS.") from None
 
     def stop(self):
-        self.ready.clear()
-        stream, self.stream = self.stream, None
-        if stream is not None:
-            try:
-                stream.abort()
-            finally:
-                stream.close()
+        self.stream.close()
 
 
 class FrameNormalizer:

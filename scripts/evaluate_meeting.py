@@ -33,7 +33,7 @@ def evaluate(reference, hypothesis, collar=.25):
         if not (math.isfinite(row["start"]) and math.isfinite(row["end"]) and
                 0 <= row["start"] < row["end"] <= 86400):
             raise ValueError("Invalid annotation timestamps")
-    errors = words = missed = false_alarm = confused = speech = scored = 0
+    errors = words = missed = false_alarm = confused = speech = scored = unknown = short_unknown = 0
     for source in {row["source"] for row in [*reference, *hypothesis]}:
         ref = sorted([row for row in reference if row["source"] == source], key=lambda row: row["start"])
         hyp = sorted([row for row in hypothesis if row["source"] == source], key=lambda row: row["start"])
@@ -63,6 +63,12 @@ def evaluate(reference, hypothesis, collar=.25):
                 valid[max(0, round((at - collar) * 100)):round((at + collar) * 100)] = False
         scored += int(valid.sum())
         ref_speech, hyp_speech = r >= 0, h != -1
+        unknown_mask = valid & ref_speech & (h == -3)
+        unknown += int(np.count_nonzero(unknown_mask))
+        for row in ref:
+            if row["end"] - row["start"] <= 1.2:
+                a, b = round(row["start"] * 100), round(row["end"] * 100)
+                short_unknown += int(np.count_nonzero(unknown_mask[a:b]))
         speech += int(np.count_nonzero(valid & ref_speech))
         missed += int(np.count_nonzero(valid & ref_speech & ~hyp_speech))
         false_alarm += int(np.count_nonzero(valid & ~ref_speech & hyp_speech))
@@ -84,6 +90,8 @@ def evaluate(reference, hypothesis, collar=.25):
             "non_overlap_der": (missed + false_alarm + confused) / speech if speech else None,
             "missed_seconds": missed / 100, "false_alarm_seconds": false_alarm / 100,
             "speaker_error_seconds": confused / 100, "reference_speech_seconds": speech / 100,
+            "wrong_speaker_seconds": (confused - unknown) / 100,
+            "unknown_speaker_seconds": unknown / 100, "short_unknown_speaker_seconds": short_unknown / 100,
             "scored_seconds": scored / 100, "collar_seconds": collar,
             "notes": "10 ms grid; excludes overlap in either annotation; optimal speaker mapping per source."}
 

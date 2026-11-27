@@ -77,6 +77,7 @@ class AudioRecorder:
         self._frames: list[np.ndarray] = []
         self._sample_count = 0
         self._recording = False
+        self.first_pcm_at = None
         self._current_level = 0.0
         self._speech_speed = 1.0
         self._prev_rms = 0.0
@@ -182,6 +183,8 @@ class AudioRecorder:
         with self._lock:
             if not self._recording:
                 return
+            if frames > 0 and self.first_pcm_at is None:
+                self.first_pcm_at = time.monotonic()
             self._frames.append(indata.copy())
             self._sample_count += len(indata)
 
@@ -238,6 +241,7 @@ class AudioRecorder:
                 self._frames = []
                 self._sample_count = 0
                 self._recording = True
+                self.first_pcm_at = None
                 self._current_level = 0.0
                 self._prev_rms = 0.0
                 self._speech_speed = 1.0
@@ -269,6 +273,12 @@ class AudioRecorder:
                     if not self._close_stream_locked():
                         break
                     if attempt == 0:
+                        with self._lock:
+                            if not self._recording:
+                                break
+                            self._frames.clear()
+                            self._sample_count = 0
+                            self.first_pcm_at = None
                         time.sleep(0.05)
 
             with self._lock:
