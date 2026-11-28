@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from giga_dictate.diarization import OnlineDiarizer, SpeakerCountError
+from giga_dictate.diarization import OnlineDiarizer, SpeakerCountError, suppress_remote_echo
 from giga_dictate.meeting_types import MeetingOptions, SpeakerEvidence, SpeechSegment, TranscriptTurn
 from giga_dictate.speaker_clustering import average_linkage, stable_mapping
 from tests.test_meeting import vector
@@ -134,15 +134,13 @@ class GlobalSpeakers(TestCase):
         self.assertEqual(turns[1].effective_speaker_id, first)
         self.assertEqual(d.speakers[first].name, "Алексей")
 
-    def test_online_clustering_excludes_fixed_microphone_even_with_evidence(self):
-        d = OnlineDiarizer(None, speaker_offset=1, speaker_count=2)
+    def test_online_galleries_do_not_mix_across_diarizers(self):
+        call = OnlineDiarizer(None, id_prefix="call", name_prefix="В созвоне", speaker_count=2)
         turns, evidence = conversation([0, 1] * 4, source="system")
-        local = TranscriptTurn(99, 0, 3, "microphone", "speaker-1", "Тест")
-        evidence[99] = summary(vector(7), 0, 3.)
-        # Evidence should never normally be supplied for the fixed mic.
-        d.refine(turns + [local], evidence)
-        self.assertEqual(local.speaker_id, "speaker-1")
-        self.assertEqual({t.speaker_id for t in turns}, {"speaker-2", "speaker-3"})
+        local = TranscriptTurn(99, 0, 3, "microphone", "room-1", "Тест")
+        call.refine(turns, evidence)
+        self.assertEqual(local.speaker_id, "room-1")
+        self.assertEqual({t.speaker_id for t in turns}, {"call-1", "call-2"})
 
     def test_exact_count_can_split_similar_voices(self):
         d = OnlineDiarizer(None, speaker_count=2)
@@ -258,3 +256,53 @@ class ClusteringContracts(TestCase):
         with patch("giga_dictate.diarization.average_linkage", side_effect=check) as cluster:
             d.refine(turns, evidence)
         cluster.assert_called_once()
+
+
+class RemoteEchoSuppression(TestCase):
+    def setUp(self):
+        self.call = OnlineDiarizer(None, id_prefix="call", name_prefix="В созвоне")
+        self.call.identify(vector())
+
+    def test_duplicate_text_removes_microphone_turn(self):
+        turns = [TranscriptTurn(1, 0, 2, "system", "call-1", "Привет как дела"),
+                 TranscriptTurn(2, .1, 2.1, "microphone", "room-2", "Привет как дела")]
+        evidence = {1: summary(vector(), 0, 2), 2: summary(vector(), .1, 2)}
+        suppress_remote_echo(turns, evidence, self.call)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].speaker_id, "call-1")
+
+    def test_different_text_reassigns_to_call_speaker(self):
+        turns = [TranscriptTurn(1, 0, 2, "system", "call-1", "Привет как дела"),
+                 TranscriptTurn(2, .1, 2.1, "microphone", "room-2", "Другая фраза")]
+        evidence = {1: summary(vector(), 0, 2), 2: summary(vector(), .1, 2)}
+        suppress_remote_echo(turns, evidence, self.call)
+        self.assertEqual(len(turns), 2)
+        mic = next(turn for turn in turns if turn.source == "microphone")
+        self.assertEqual(mic.speaker_id, "call-1")
+        self.assertFalse(mic.speaker_id.startswith("room-"))
+
+    def test_late_microphone_without_overlap_stays_room(self):
+        turns = [TranscriptTurn(1, 0, 2, "system", "call-1", "Привет как дела"),
+                 TranscriptTurn(2, 2.5, 4.5, "microphone", "room-1", "Привет как дела")]
+        evidence = {1: summary(vector(), 0, 2), 2: summary(vector(), 2.5, 2)}
+        suppress_remote_echo(turns, evidence, self.call)
+        mic = next(turn for turn in turns if turn.source == "microphone")
+        self.assertEqual(mic.speaker_id, "room-1")
+
+    def test_mismatched_embedding_stays_room(self):
+        turns = [TranscriptTurn(1, 0, 2, "system", "call-1", "Привет как дела"),
+                 TranscriptTurn(2, .1, 2.1, "microphone", "room-1", "Привет как дела")]
+        evidence = {1: summary(vector(), 0, 2), 2: summary(vector(1), .1, 2)}
+        suppress_remote_echo(turns, evidence, self.call)
+        mic = next(turn for turn in turns if turn.source == "microphone")
+        self.assertEqual(mic.speaker_id, "room-1")
+
+    def test_manual_microphone_assignment_is_preserved(self):
+        turns = [TranscriptTurn(1, 0, 2, "system", "call-1", "Привет как дела"),
+                 TranscriptTurn(2, .1, 2.1, "microphone", "room-2", "Привет как дела",
+                               manual_speaker_id="room-9")]
+        evidence = {1: summary(vector(), 0, 2), 2: summary(vector(), .1, 2)}
+        suppress_remote_echo(turns, evidence, self.call)
+        mic = next(turn for turn in turns if turn.source == "microphone")
+        self.assertEqual(mic.speaker_id, "room-2")
+        self.assertEqual(mic.manual_speaker_id, "room-9")

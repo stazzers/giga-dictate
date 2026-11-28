@@ -4,11 +4,24 @@ import time
 from collections import deque
 from datetime import datetime
 
-from .diarization import CAMPlusEmbedder, OnlineDiarizer, SpeakerCountError
+import numpy as np
+
+from .diarization import CAMPlusEmbedder, OnlineDiarizer, SpeakerCountError, suppress_remote_echo
+from .echo_cancel import EchoCanceller
 from .meeting_audio import FrameNormalizer, MicrophoneStream
 from .meeting_models import find_models
-from .meeting_types import MeetingResult, MeetingState, Speaker, TranscriptTurn
+from .meeting_types import MeetingResult, MeetingState, TranscriptTurn
 from .vad import SileroProbability, StreamingVAD
+
+MIN_TRANSCRIBE_SAMPLES = 3200
+
+
+def voiced_pcm(segment):
+    pcm = np.asarray(segment.pcm, np.float32)
+    mask = segment.speech_mask
+    if mask is None or len(mask) != len(pcm):
+        return pcm
+    return pcm[mask.astype(bool)]
 
 
 class MeetingSession:
@@ -182,8 +195,12 @@ class MeetingSession:
         result = MeetingResult(session_id, datetime.now().astimezone())
         writer = None
         diarizer = None
+        room_diarizer = None
+        call_diarizer = None
+        online = False
         speaker_evidence = {}
         vads, normalizers = {}, {}
+        canceller = None
         watcher = None
         processing_start = None
         processing_failed = False
@@ -194,11 +211,14 @@ class MeetingSession:
             embedder = self.embedder_factory(models / "campplus.onnx")
             online = self.options.mode == "online"
             count = self.options.speaker_count
-            diarizer = OnlineDiarizer(embedder, speaker_offset=1 if online else 0,
-                                     speaker_count=None if count is None else count - int(online))
-            result.speakers.update(diarizer.speakers)
             if online:
-                result.speakers["speaker-1"] = Speaker("speaker-1", "Спикер 1")
+                room_diarizer = OnlineDiarizer(embedder, id_prefix="room", name_prefix="В комнате")
+                call_diarizer = OnlineDiarizer(embedder, id_prefix="call", name_prefix="В созвоне")
+                result.speakers.update(room_diarizer.speakers)
+                result.speakers.update(call_diarizer.speakers)
+            else:
+                diarizer = OnlineDiarizer(embedder, speaker_count=count)
+                result.speakers.update(diarizer.speakers)
             sources = ["microphone"] + (["system"] if self.options.mode == "online" else [])
             for name in sources:
                 vads[name] = StreamingVAD(name, self.vad_factory(models / "silero_vad.onnx"))
@@ -217,6 +237,8 @@ class MeetingSession:
             self.started = self.clock()
             result.started_at = datetime.now().astimezone()
             normalizers = {name: FrameNormalizer(self.started) for name in sources}
+            if online:
+                canceller = EchoCanceller()
             watcher = threading.Thread(target=self._watch, args=(session_id,),
                                        name="GigaMeetingCaptureStop", daemon=True)
             watcher.start()
@@ -244,16 +266,19 @@ class MeetingSession:
                 processing_start = segment.start
                 if self._cancel.is_set():
                     return
-                if self.options.mode == "online" and segment.source == "microphone":
-                    pieces = [(segment, "speaker-1")]
+                if online:
+                    active = room_diarizer if segment.source == "microphone" else call_diarizer
+                    pieces = active.split(segment)
                 else:
+                    active = diarizer
                     pieces = diarizer.split(segment)
-                result.speakers.update({key: value for key, value in diarizer.speakers.items()
+                result.speakers.update({key: value for key, value in active.speakers.items()
                                         if key not in result.speakers})
                 for piece, speaker in pieces:
-                    if len(piece.pcm) < 3200:
+                    audio = voiced_pcm(piece)
+                    if len(audio) < MIN_TRANSCRIBE_SAMPLES:
                         continue
-                    text = self.engine.transcribe(piece.pcm)
+                    text = self.engine.transcribe(audio)
                     if text:
                         turn = TranscriptTurn(len(result.turns) + 1, piece.start, piece.end,
                             piece.source, speaker, text,
@@ -278,10 +303,24 @@ class MeetingSession:
                 start, pcm, gap = normalizers[frame.source].convert(frame)
                 if gap:
                     result.errors.append(f"Разрыв аудиопотока {frame.source} около {start:.1f} с")
+                    if canceller is not None:
+                        canceller.note_gap(frame.source)
                 if writer:
                     writer.feed(frame.source, start, pcm)
-                for segment in vads[frame.source].feed(start, pcm):
-                    recognize(segment)
+                if canceller is not None:
+                    if frame.source == "system":
+                        for chunk_start, chunk_pcm in canceller.push_far(start, pcm):
+                            for segment in vads["microphone"].feed(chunk_start, chunk_pcm):
+                                recognize(segment)
+                        for segment in vads["system"].feed(start, pcm):
+                            recognize(segment)
+                    else:
+                        for chunk_start, chunk_pcm in canceller.push_near(start, pcm):
+                            for segment in vads["microphone"].feed(chunk_start, chunk_pcm):
+                                recognize(segment)
+                else:
+                    for segment in vads[frame.source].feed(start, pcm):
+                        recognize(segment)
             self._stop.set()
             if not self._cancel.is_set():
                 for name, normalizer in normalizers.items():
@@ -289,10 +328,30 @@ class MeetingSession:
                     if len(pcm):
                         if writer:
                             writer.feed(name, start, pcm)
-                        for segment in vads[name].feed(start, pcm):
+                        if canceller is not None:
+                            if name == "system":
+                                for chunk_start, chunk_pcm in canceller.push_far(start, pcm):
+                                    for segment in vads["microphone"].feed(chunk_start, chunk_pcm):
+                                        recognize(segment)
+                                for segment in vads["system"].feed(start, pcm):
+                                    recognize(segment)
+                            else:
+                                for chunk_start, chunk_pcm in canceller.push_near(start, pcm):
+                                    for segment in vads["microphone"].feed(chunk_start, chunk_pcm):
+                                        recognize(segment)
+                        else:
+                            for segment in vads[name].feed(start, pcm):
+                                recognize(segment)
+                    if canceller is None:
+                        for segment in vads[name].flush():
                             recognize(segment)
-                    for segment in vads[name].flush():
-                        recognize(segment)
+                if canceller is not None:
+                    for chunk_start, chunk_pcm in canceller.flush():
+                        for segment in vads["microphone"].feed(chunk_start, chunk_pcm):
+                            recognize(segment)
+                    for name in normalizers:
+                        for segment in vads[name].flush():
+                            recognize(segment)
         except ValueError as error:
             processing_failed = True
             # Only controlled validation messages; inference exceptions can contain
@@ -309,30 +368,85 @@ class MeetingSession:
                 self._close_sources(session_id)
             self.stopped = self.stopped or self.clock()
             result.duration = self.elapsed
-            if diarizer is not None:
-                if not self._cancel.is_set():
-                    preliminary = [(turn.speaker_id, turn.attribution) for turn in result.turns]
-                    try:
-                        diarizer.refine(result.turns, speaker_evidence)
-                    except SpeakerCountError as error:
-                        for turn, (key, attribution) in zip(result.turns, preliminary):
-                            turn.speaker_id, turn.attribution = key, attribution
-                        result.errors.append(str(error))
-                    except Exception:
-                        for turn, (key, attribution) in zip(result.turns, preliminary):
-                            turn.speaker_id, turn.attribution = key, attribution
-                        result.errors.append("Не удалось уточнить спикеров; сохранены предварительные назначения")
-                result.speakers.update({key: value for key, value in diarizer.speakers.items()
-                                        if key not in result.speakers})
+            def restore_preliminary():
                 for turn in result.turns:
+                    saved = preliminary.get(turn.id)
+                    if saved is not None:
+                        turn.speaker_id, turn.attribution = saved
+
+            def resolve_all_turns():
+                for turn in result.turns:
+                    if online:
+                        key = turn.speaker_id
+                        if key.startswith("call-"):
+                            owner = call_diarizer
+                        elif key.startswith("room-") or key.startswith("pending-"):
+                            owner = room_diarizer
+                        else:
+                            owner = room_diarizer if turn.source == "microphone" else call_diarizer
+                    else:
+                        owner = diarizer
                     provisional = turn.speaker_id.startswith("pending-")
-                    turn.speaker_id = diarizer.resolve_speaker(turn.speaker_id)
+                    turn.speaker_id = owner.resolve_speaker(turn.speaker_id)
                     if turn.speaker_id == "unknown":
                         turn.attribution = "uncertain"
                     elif provisional:
                         turn.attribution = "automatic"
-                # Provisional clusters which never produced text are not people
-                # and must not appear as phantom participants in the result UI.
+
+            if online and room_diarizer is not None:
+                if not self._cancel.is_set():
+                    preliminary = {turn.id: (turn.speaker_id, turn.attribution) for turn in result.turns}
+                    try:
+                        mic_turns = [turn for turn in result.turns if turn.source == "microphone"]
+                        sys_turns = [turn for turn in result.turns if turn.source == "system"]
+                        mic_evidence = {turn.id: speaker_evidence[turn.id] for turn in mic_turns
+                                        if turn.id in speaker_evidence}
+                        sys_evidence = {turn.id: speaker_evidence[turn.id] for turn in sys_turns
+                                        if turn.id in speaker_evidence}
+                        room_diarizer.refine(mic_turns, mic_evidence)
+                        call_diarizer.refine(sys_turns, sys_evidence)
+                        suppress_remote_echo(result.turns, speaker_evidence, call_diarizer)
+                        if count is not None:
+                            found = {turn.effective_speaker_id for turn in result.turns
+                                     if turn.effective_speaker_id != "unknown"}
+                            if count == 1 and any(turn.source == "system" for turn in result.turns):
+                                restore_preliminary()
+                                result.errors.append(
+                                    "Указан один голос, но слышна речь в системном канале; "
+                                    "сохранены предварительные назначения")
+                            elif len(found) != count:
+                                restore_preliminary()
+                                result.errors.append(
+                                    "Недостаточно независимой речи для указанного количества голосов; "
+                                    "сохранены предварительные назначения")
+                    except SpeakerCountError as error:
+                        restore_preliminary()
+                        result.errors.append(str(error))
+                    except Exception:
+                        restore_preliminary()
+                        result.errors.append(
+                            "Не удалось уточнить спикеров; сохранены предварительные назначения")
+                for owner in (room_diarizer, call_diarizer):
+                    result.speakers.update({key: value for key, value in owner.speakers.items()
+                                            if key not in result.speakers})
+                resolve_all_turns()
+                used = {turn.effective_speaker_id for turn in result.turns}
+                result.speakers = {key: speaker for key, speaker in result.speakers.items() if key in used}
+            elif diarizer is not None:
+                if not self._cancel.is_set():
+                    preliminary = {turn.id: (turn.speaker_id, turn.attribution) for turn in result.turns}
+                    try:
+                        diarizer.refine(result.turns, speaker_evidence)
+                    except SpeakerCountError as error:
+                        restore_preliminary()
+                        result.errors.append(str(error))
+                    except Exception:
+                        restore_preliminary()
+                        result.errors.append(
+                            "Не удалось уточнить спикеров; сохранены предварительные назначения")
+                result.speakers.update({key: value for key, value in diarizer.speakers.items()
+                                        if key not in result.speakers})
+                resolve_all_turns()
                 used = {turn.effective_speaker_id for turn in result.turns}
                 result.speakers = {key: speaker for key, speaker in result.speakers.items() if key in used}
             speaker_evidence.clear()

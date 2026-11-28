@@ -87,12 +87,12 @@ class SpeakerStability(unittest.TestCase):
         self.assertEqual(set(diarizer.centers), {first, second})
 
     def test_manual_assignments_and_online_microphone_are_preserved(self):
-        diarizer = OnlineDiarizer(lambda pcm: vector(), speaker_offset=1)
-        remote, other = self.confirm_two(diarizer)
-        local = TranscriptTurn(1, 0, 2, "microphone", "speaker-1", "")
+        call = OnlineDiarizer(lambda pcm: vector(), id_prefix="call", name_prefix="В созвоне")
+        remote, other = self.confirm_two(call)
+        local = TranscriptTurn(1, 0, 2, "microphone", "room-1", "")
         manual = TranscriptTurn(2, 0, 2, "system", "unknown", "", manual_speaker_id=other)
-        diarizer.refine([local, manual], {2: self.evidence(vector())})
-        self.assertEqual(local.speaker_id, "speaker-1")
+        call.refine([manual], {2: self.evidence(vector())})
+        self.assertEqual(local.speaker_id, "room-1")
         self.assertEqual(manual.effective_speaker_id, other)
         self.assertNotEqual(manual.effective_speaker_id, remote)
 

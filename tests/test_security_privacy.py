@@ -1,7 +1,20 @@
 from tests.support import IsolatedTestCase
+import io
+import logging
 import os
+import re
 import stat
+import tempfile
+import threading
 import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import numpy as np
+
+from giga_dictate.meeting_session import MeetingSession
+from giga_dictate.meeting_types import AudioFrame, MeetingOptions, MeetingState
+from tests.test_meeting import Capture, Probability, vector
 from AppKit import NSPasteboardTypeString
 from giga_dictate.config import AppConfig
 from giga_dictate import config as config_module
@@ -67,6 +80,70 @@ class TestSecurityAndPrivacy(IsolatedTestCase):
         current = pb.stringForType_(NSPasteboardTypeString)
         self.assertNotEqual(current, "TEMPORARY_VOICE_TEXT")
         self.assertEqual(current, "PREVIOUS_USER_COPY")
+
+    def test_online_meeting_no_network_or_sensitive_logs(self):
+        """Online capture/inference must stay offline and keep transcripts/PCM out of logs."""
+        secret = "Уникальная фраза созвона 481516"
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        recording, complete = threading.Event(), threading.Event()
+
+        engine = Mock(is_loaded=True)
+        engine.transcribe.return_value = secret
+
+        def notify(event):
+            if event.get("state") == MeetingState.RECORDING:
+                recording.set()
+            if event.get("kind") == "complete":
+                complete.set()
+
+        def capture(*args):
+            return Capture(*args)
+
+        session = MeetingSession(
+            engine,
+            notify=notify,
+            model_finder=lambda: Path(temporary.name),
+            microphone_factory=capture,
+            system_factory=capture,
+            vad_factory=lambda path: Probability(),
+            embedder_factory=lambda path: lambda pcm: vector(),
+        )
+        self.addCleanup(session.cancel)
+        self.addCleanup(lambda: session.worker and session.worker.join(5))
+
+        log_buffer = io.StringIO()
+        handler = logging.Handler()
+        handler.emit = lambda record: log_buffer.write(handler.format(record) + "\n")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+
+        root_logger = logging.getLogger()
+        app_logger = logging.getLogger("giga_dictate")
+        for logger in (root_logger, app_logger):
+            logger.addHandler(handler)
+            self.addCleanup(lambda lg=logger: lg.removeHandler(handler))
+
+        with patch("socket.socket", side_effect=AssertionError("network")):
+            self.assertTrue(session.start(MeetingOptions("online")))
+            self.assertTrue(recording.wait(3))
+            session._enqueue(AudioFrame(
+                "microphone", 0, session.started, 16000,
+                np.full(int(16000 * 2), 0.1, np.float32),
+            ))
+            session.stop()
+            self.assertTrue(complete.wait(5))
+
+        result = session.result
+        self.assertTrue(result.turns)
+        self.assertEqual(result.turns[0].text, secret)
+
+        captured = log_buffer.getvalue()
+        self.assertNotIn(secret, captured)
+        self.assertFalse(
+            re.search(r"array\s*\(\s*\[", captured)
+            or re.search(r"(?:-?\d+\.\d+,\s*){24,}", captured),
+            "Application logs must not dump PCM samples",
+        )
 
 
 if __name__ == "__main__":

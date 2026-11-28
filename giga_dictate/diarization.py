@@ -34,6 +34,76 @@ def gallery_center(vectors):
     return unit(mean) if np.linalg.norm(mean) >= 1e-8 else unit(vectors[0])
 
 
+def _normalize_transcript_text(text):
+    return " ".join(text.casefold().split())
+
+
+def _transcript_text_echoes(a, b):
+    na, nb = _normalize_transcript_text(a), _normalize_transcript_text(b)
+    if na == nb:
+        return True
+    if not na or not nb:
+        return False
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    return shorter in longer and len(shorter) >= .7 * len(longer)
+
+
+def _call_speaker_score(vector, call_diarizer, key):
+    refs = call_diarizer.references.get(key)
+    if refs:
+        return max(float(vector @ unit(ref)) for ref in refs)
+    return float(vector @ call_diarizer.centers[key])
+
+
+def _match_call_speaker(center, call_diarizer):
+    keys = [key for key in call_diarizer.centers
+            if key != "unknown" and not key.startswith("pending-")]
+    if not keys:
+        return None
+    scores = {key: _call_speaker_score(center, call_diarizer, key) for key in keys}
+    best = max(scores, key=scores.get)
+    runner = max((score for key, score in scores.items() if key != best), default=0.)
+    if scores[best] >= .66 and scores[best] - runner >= .20:
+        return best
+    return None
+
+
+def suppress_remote_echo(turns, evidence, call_diarizer):
+    """Remove or reassign microphone echo after both online diarizers refine."""
+    if call_diarizer is None:
+        return
+    system_turns = [turn for turn in turns if turn.source == "system"]
+    remove = []
+    for turn in turns:
+        if turn.source != "microphone" or turn.manual_speaker_id is not None:
+            continue
+        item = evidence.get(turn.id)
+        if item is None:
+            continue
+        vectors = np.asarray(item.vectors, np.float32)
+        if vectors.ndim != 2 or vectors.shape[1] != 192 or not np.isfinite(vectors).all():
+            continue
+        quality = np.ones(len(vectors), bool) if item.quality is None else np.asarray(item.quality) >= .65
+        if not quality.any():
+            continue
+        center = unit(np.mean(vectors[quality], axis=0))
+        call_key = _match_call_speaker(center, call_diarizer)
+        if call_key is None:
+            continue
+        window_start = turn.start - .4
+        overlapping = [other for other in system_turns
+                       if other.end > window_start and other.start < turn.end]
+        if not overlapping:
+            continue
+        if any(_transcript_text_echoes(turn.text, other.text) for other in overlapping):
+            remove.append(turn)
+            continue
+        turn.speaker_id = call_key
+        turn.attribution = "automatic"
+    for turn in remove:
+        turns.remove(turn)
+
+
 class CAMPlusEmbedder:
     def __init__(self, path):
         import kaldi_native_fbank as knf
@@ -67,10 +137,12 @@ class CAMPlusEmbedder:
 class OnlineDiarizer:
     # Initial conservative defaults, exposed for corpus-based calibration.
     def __init__(self, embedder, match=.5, new=.3, speaker_offset=0, speaker_count=None,
-                 cluster_match=.45):
+                 cluster_match=.45, id_prefix="speaker", name_prefix="Спикер"):
         self.embedder = embedder
         self.match, self.new = match, new
         self.speaker_offset = speaker_offset
+        self.id_prefix = id_prefix
+        self.name_prefix = name_prefix
         # Count is for this diarized channel, excluding the fixed online mic.
         self.speaker_count = speaker_count
         self.cluster_match = cluster_match
@@ -135,14 +207,15 @@ class OnlineDiarizer:
                 return "unknown"
         if len(self.centers) >= 15:
             return "unknown"
+        prefix = self.id_prefix + "-"
         number = max([self.speaker_offset, *[int(k.split("-")[1]) for k in self.speakers
-                                            if k.startswith("speaker-")]]) + 1
-        key = f"speaker-{number}"
+                                            if k.startswith(prefix)]]) + 1
+        key = f"{self.id_prefix}-{number}"
         self.centers[key] = vector.copy()
         self.references[key] = [v.copy() for v in refs]
         self.reference_origins[key] = [None] * len(refs)
         self.counts[key] = 1
-        self.speakers[key] = Speaker(key, f"Спикер {number}")
+        self.speakers[key] = Speaker(key, f"{self.name_prefix} {number}")
         if candidate:
             self.aliases[candidate] = key
             del self.candidates[candidate]
@@ -363,17 +436,18 @@ class OnlineDiarizer:
         mapping = stable_mapping(votes, old_keys)
         # Never remove or repurpose an ID selected explicitly by the user.
         protected = manual - set(mapping.values())
+        prefix = self.id_prefix + "-"
         next_number = max([self.speaker_offset, *[int(k.split("-")[1]) for k in self.speakers
-                            if k.startswith("speaker-")]]) + 1
+                            if k.startswith(prefix)]]) + 1
         gallery = {}
         gallery_origins = {}
         redirects = {}
         for index, group in enumerate(supported):
             key = mapping.get(index)
             if key is None:
-                key = f"speaker-{next_number}"
+                key = f"{self.id_prefix}-{next_number}"
                 next_number += 1
-                self.speakers[key] = Speaker(key, f"Спикер {key.split('-')[1]}")
+                self.speakers[key] = Speaker(key, f"{self.name_prefix} {key.split('-')[1]}")
             # A bounded, diverse gallery, rather than all observations of a
             # dominant person drowning out a short-lived participant.
             trusted = [i for i in group if anchors[i] is not None]

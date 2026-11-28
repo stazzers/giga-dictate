@@ -13,7 +13,7 @@ import numpy as np
 
 from giga_dictate.diarization import OnlineDiarizer, unit
 from giga_dictate.meeting_audio import FrameNormalizer
-from giga_dictate.meeting_session import MeetingSession
+from giga_dictate.meeting_session import MIN_TRANSCRIBE_SAMPLES, MeetingSession, voiced_pcm
 from giga_dictate.meeting_types import (AudioFrame, MeetingOptions, MeetingResult,
     MeetingState, Speaker, SpeechSegment, TranscriptTurn)
 from giga_dictate.meeting_writer import TimelineWriter
@@ -121,6 +121,22 @@ class MeetingVAD(unittest.TestCase):
         self.assertLessEqual(len(results[0].pcm), 15 * 16000)
         self.assertEqual(sum(len(x.pcm) for x in results), len(audio))
         self.assertAlmostEqual(results[-1].end, len(audio) / 16000)
+
+    def test_voiced_pcm_helpers(self):
+        spoken = np.full(16000, .1, np.float32)
+        silent = np.zeros(32000, np.float32)
+        pcm = np.concatenate((spoken, silent))
+        mask = np.concatenate((np.ones(16000, bool), np.zeros(32000, bool)))
+        segment = SpeechSegment("microphone", 0, len(pcm) / 16000, pcm, mask)
+        voiced = voiced_pcm(segment)
+        self.assertEqual(len(voiced), 16000)
+        self.assertGreater(np.max(np.abs(voiced)), .01)
+        short_mask = np.zeros(len(pcm), bool)
+        short_mask[:1600] = True
+        short = voiced_pcm(SpeechSegment("microphone", 0, 1, pcm, short_mask))
+        self.assertLess(len(short), MIN_TRANSCRIBE_SAMPLES)
+        bare = SpeechSegment("microphone", 0, 1, spoken, None)
+        np.testing.assert_array_equal(voiced_pcm(bare), spoken)
 
     def test_discontinuity_flushes_previous_phrase(self):
         vad = StreamingVAD("system", Probability())
@@ -380,17 +396,39 @@ class MeetingLifecycle(unittest.TestCase):
         self.assertFalse(result.errors)
 
     def test_online_sources_remain_separate_and_overlap(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
         self.start("online")
         self.feed("microphone")
-        self.feed("system")
+        self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000,
+                                         np.full(int(16000 * 2), -.2, np.float32)))
         result = self.finish()
         self.assertEqual(len(self.captures), 2)
         self.assertEqual(len(result.turns), 2)
         by_source = {turn.source: turn for turn in result.turns}
-        self.assertEqual(by_source["microphone"].speaker_id, "speaker-1")
-        self.assertEqual(by_source["system"].speaker_id, "speaker-2")
+        self.assertEqual(by_source["microphone"].speaker_id, "room-1")
+        self.assertEqual(by_source["system"].speaker_id, "call-1")
+        self.assertEqual(result.speakers["room-1"].name, "В комнате 1")
+        self.assertEqual(result.speakers["call-1"].name, "В созвоне 1")
         self.assertNotIn("Вы", [speaker.name for speaker in result.speakers.values()])
         self.assertEqual(by_source["system"].start, by_source["microphone"].start)
+
+    def test_online_echo_cancel_keeps_raw_recording_and_mic_turn(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
+        path = Path(self.temporary.name) / "online.wav"
+        self.start("online", audio_path=str(path))
+        for i in range(0, 32000, 512):
+            size = min(512, 32000 - i)
+            pcm = np.full(size, .1, np.float32)
+            seq = (i // 512) * 2
+            self.manager._enqueue(AudioFrame("microphone", seq, self.manager.started, 16000, pcm))
+            self.manager._enqueue(AudioFrame("system", seq + 1, self.manager.started, 16000,
+                                             np.full(size, -.2, np.float32)))
+        result = self.finish()
+        with wave.open(str(path)) as handle:
+            data = np.frombuffer(handle.readframes(handle.getnframes()), "<i2").reshape(-1, 2)
+        self.assertGreater(int(np.max(np.abs(data[:, 0]))), 2500)
+        mic_turns = [turn for turn in result.turns if turn.source == "microphone"]
+        self.assertTrue(mic_turns)
 
     def test_no_disk_and_no_network_without_opt_in(self):
         with patch("socket.socket", side_effect=AssertionError("network")), \
@@ -466,15 +504,17 @@ class MeetingLifecycle(unittest.TestCase):
         self.assertEqual(self.engine.transcribe.call_count, len(result.turns))
         self.assertEqual(result.errors, [])
 
-    def test_exact_online_count_includes_fixed_microphone(self):
-        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
+    def test_exact_online_count_spans_room_and_call(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(
+            2 if pcm.mean() > .15 else (0 if pcm.mean() > 0 else 1))
         self.start("online", speaker_count=3)
         pcm = np.concatenate([p for level in (.1, -.1, .1, -.1) for p in
                               (np.full(32000, level, np.float32), np.zeros(12800, np.float32))])
         self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000, pcm))
-        self.feed("microphone")
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000,
+                                         np.full(int(16000 * 2), .2, np.float32)))
         result = self.finish()
-        self.assertEqual({t.speaker_id for t in result.turns}, {"speaker-1", "speaker-2", "speaker-3"})
+        self.assertEqual({t.speaker_id for t in result.turns}, {"room-1", "call-1", "call-2"})
         self.assertEqual(result.errors, [])
 
     def test_impossible_count_returns_controlled_warning_and_preliminary_text(self):
@@ -487,8 +527,10 @@ class MeetingLifecycle(unittest.TestCase):
         self.assertTrue(any("Недостаточно независимой речи" in error for error in result.errors))
 
     def test_one_online_voice_rejects_system_speech_but_retains_it(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
         self.start("online", speaker_count=1)
-        self.feed("system")
+        self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000,
+                                         np.full(int(16000 * 2), -.2, np.float32)))
         self.feed("microphone")
         result = self.finish()
         self.assertEqual(len(result.turns), 2)
@@ -506,15 +548,99 @@ class MeetingLifecycle(unittest.TestCase):
         self.assertNotIn("private model input", str(result.errors))
 
     def test_remote_first_numbering_never_collides_with_microphone(self):
-        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(
+            2 if pcm.mean() > .15 else (0 if pcm.mean() > 0 else 1))
         self.start("online")
         pcm = np.concatenate((np.full(48000, .1), np.full(48000, -.1))).astype(np.float32)
         self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000, pcm))
-        self.feed("microphone")
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000,
+                                         np.full(int(16000 * 2), .2, np.float32)))
         result = self.finish()
-        self.assertEqual({turn.speaker_id for turn in result.turns}, {"speaker-1", "speaker-2", "speaker-3"})
+        self.assertEqual({turn.speaker_id for turn in result.turns}, {"room-1", "call-1", "call-2"})
         self.assertEqual({speaker.name for key, speaker in result.speakers.items() if key != "unknown"},
-                         {"Спикер 1", "Спикер 2", "Спикер 3"})
+                         {"В комнате 1", "В созвоне 1", "В созвоне 2"})
+
+    def test_two_local_voices_stay_in_the_room(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector(0 if pcm.mean() > 0 else 1)
+        self.start("online")
+        pcm = np.concatenate((np.full(48000, .1), np.full(48000, -.1))).astype(np.float32)
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000, pcm))
+        self.manager._enqueue(AudioFrame("system", 1, self.manager.started, 16000,
+                                         np.full(32000, -.2, np.float32)))
+        result = self.finish()
+        mic_turns = [turn for turn in result.turns if turn.source == "microphone"]
+        room_ids = {turn.speaker_id for turn in mic_turns if turn.speaker_id.startswith("room-")}
+        self.assertEqual(room_ids, {"room-1", "room-2"})
+        self.assertTrue(all(not turn.speaker_id.startswith("call-") for turn in mic_turns))
+
+    def test_transcribe_receives_voiced_audio_without_trailing_silence(self):
+        lengths = []
+
+        def transcribe(audio):
+            lengths.append(len(audio))
+            return "Проверка встречи"
+
+        self.engine.transcribe.side_effect = transcribe
+        self.start()
+        spoken = np.full(16000, .1, np.float32)
+        silent = np.zeros(8000, np.float32)
+        pcm = np.concatenate((spoken, silent))
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000, pcm))
+        result = self.finish()
+        self.assertEqual(len(result.turns), 1)
+        self.assertEqual(len(lengths), 1)
+        self.assertLess(lengths[0], len(pcm))
+        self.assertGreater(lengths[0], len(spoken) * .9)
+        passed = self.engine.transcribe.call_args[0][0]
+        self.assertGreater(np.max(np.abs(passed)), .01)
+
+    def test_short_voiced_mask_skips_transcription(self):
+        pcm = np.full(6400, .1, np.float32)
+        mask = np.zeros(len(pcm), bool)
+        mask[:1600] = True
+        piece = SpeechSegment("microphone", 0, .4, pcm, mask)
+        self.assertLess(len(voiced_pcm(piece)), MIN_TRANSCRIBE_SAMPLES)
+
+        def split(_self, _segment):
+            return [(piece, "speaker-1")]
+
+        with patch.object(OnlineDiarizer, "split", autospec=True, side_effect=split):
+            self.start()
+            self.feed()
+            result = self.finish()
+        self.engine.transcribe.assert_not_called()
+        self.assertEqual(result.turns, [])
+
+    def test_seventeen_second_audio_yields_two_transcribes(self):
+        self.start()
+        pcm = np.full(16000 * 17 + 123, .1, np.float32)
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000, pcm))
+        result = self.finish()
+        self.assertEqual(self.engine.transcribe.call_count, 2)
+        self.assertEqual(len(result.turns), 2)
+
+    def test_overlapping_duplicate_online_text_appears_once(self):
+        self.manager.embedder_factory = lambda path: lambda pcm: vector()
+        sentence = "Один и тот же ответ"
+        self.engine.transcribe.return_value = sentence
+        self.start("online")
+        pcm = np.full(32000, .1, np.float32)
+        self.manager._enqueue(AudioFrame("microphone", 0, self.manager.started, 16000, pcm))
+        self.manager._enqueue(AudioFrame("system", 0, self.manager.started, 16000,
+                                         np.full(32000, -.1, np.float32)))
+        result = self.finish()
+        self.assertEqual([turn.text for turn in result.turns].count(sentence), 1)
+        self.assertEqual(len(result.turns), 1)
+        self.assertEqual(result.turns[0].source, "system")
+
+    def test_transcribe_failure_stays_generic(self):
+        self.engine.transcribe.side_effect = RuntimeError("secret-pcm-9f3a")
+        self.start()
+        self.feed()
+        result = self.finish()
+        joined = " ".join(result.errors)
+        self.assertNotIn("secret-pcm-9f3a", joined)
+        self.assertIn("Ошибка обработки встречи", joined)
 
     def test_retired_mode_cannot_open_capture(self):
         with self.assertRaises(ValueError):

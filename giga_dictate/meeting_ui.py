@@ -127,7 +127,10 @@ class MeetingUI(NSObject):
             return
         alert = AK.NSAlert.alloc().init()
         alert.setMessageText_("Новая встреча")
-        alert.setInformativeText_("Созвон захватывает весь системный звук. Используйте наушники: через динамики возможно эхо и дублирование реплик.")
+        alert.setInformativeText_(
+            "Созвон записывает микрофон и весь системный звук — созвон, приложения, уведомления и музыку. "
+            "Речь из динамиков вычитается из микрофона; просочившийся удалённый голос не получает отдельного «В комнате». "
+            "Наушники полезны при остаточном дубле, но не обязательны.")
         view, mode, mic, voices, save = meeting_options_view(devices)
         alert.setAccessoryView_(view)
         alert.addButtonWithTitle_("Начать")
